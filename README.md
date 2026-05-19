@@ -11,7 +11,8 @@
 - 服务根路由：`GET /`
 - Mock 问答接口：`POST /api/chat`
 - Swagger API 文档：`GET /docs`
-- 允许个人主页 `http://localhost:3000` 跨域访问
+- 支持个人主页 `http://localhost:3000` 跨域访问
+- 支持前端 Demo 页面联调
 
 ## 技术栈
 
@@ -57,11 +58,39 @@ http://localhost:8000/docs
 http://localhost:8000/health
 ```
 
+## 前端 Demo 联调说明
+
+前端 Demo 页面位于 `personal-ai-homepage`：
+
+```text
+http://localhost:3000/demos/rag-agent
+```
+
+该页面会调用本项目的两个接口：
+
+```text
+GET  http://localhost:8000/health
+POST http://localhost:8000/api/chat
+```
+
+联调前需要先启动本服务，再启动 `personal-ai-homepage`。
+
 ## 接口说明
 
 ### GET /
 
 返回服务名称、运行状态和文档地址。
+
+示例响应：
+
+```json
+{
+  "name": "RAG Agent System MVP",
+  "status": "running",
+  "docs": "http://localhost:8000/docs",
+  "health": "http://localhost:8000/health"
+}
+```
 
 ### GET /health
 
@@ -82,7 +111,23 @@ http://localhost:8000/health
 
 发送一个问题，返回 mock 回答和 mock 引用来源。
 
-测试命令：
+请求示例：
+
+```json
+{
+  "question": "这个系统现在支持什么？"
+}
+```
+
+响应字段：
+
+```text
+answer   回答内容
+sources  mock 引用来源
+mode     当前模式，现阶段为 mock
+```
+
+PowerShell 测试命令：
 
 ```powershell
 Invoke-RestMethod `
@@ -98,8 +143,9 @@ Invoke-RestMethod `
 
 - 后端服务可以启动
 - API 文档可以访问
-- 个人主页可以跳转到本服务
-- 后续接口结构可以继续扩展
+- 个人主页 Demo 页面可以调用本服务
+- 问答接口结构可以继续扩展
+- 前端可以展示回答和引用来源
 
 ## 后续计划
 
