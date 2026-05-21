@@ -2,7 +2,7 @@
 
 企业知识库 RAG Agent 系统最小原型。
 
-当前版本是 `v1.5`，已经支持异步入库任务队列、SQLite 文档元数据存储、文档上传、批量上传、上传解析进度反馈、后端分页文档库、文本解析、结构增强 chunking、JSON chunks 留存、Chroma 本地向量库检索、Qwen Embedding、相似度阈值拒答，以及 LangGraph + LangChain + DeepSeek RAG 问答。
+当前版本是 `v1.6`，已经支持混合检索 rerank、异步入库任务队列、SQLite 文档元数据存储、文档上传、批量上传、上传解析进度反馈、后端分页文档库、文本解析、结构增强 chunking、JSON chunks 留存、Chroma 本地向量库检索、Qwen Embedding、相似度阈值拒答，以及 LangGraph + LangChain + DeepSeek RAG 问答。
 
 ## 当前功能
 
@@ -14,11 +14,51 @@
 - 文档分页列表接口：`GET /api/documents?page=1&page_size=10`
 - 文档详情接口：`GET /api/documents/{document_id}`
 - 文档删除接口：`DELETE /api/documents/{document_id}`
-- 问题检索接口：`POST /api/search`
+- 混合检索接口：`POST /api/search`
 - 向量库状态接口：`GET /api/vector-store/status`
 - 向量库重建接口：`POST /api/vector-store/rebuild`
 - LangGraph RAG 问答接口：`POST /api/chat`
 - Swagger API 文档：`GET /docs`
+
+## v1.6 检索质量优化
+
+`/api/search` 已从单一向量分数升级为混合 rerank：
+
+```text
+1. 生成问题 embedding
+2. Chroma 优先召回更多候选 chunks
+3. 提取查询关键词、中文 bigram / trigram、英文技术词
+4. 对候选 chunk 计算关键词覆盖、短语命中、标题命中、章节命中
+5. 合并 vector_score + lexical_score + structural_boost
+6. 按 rerank_score 排序，再应用 score_threshold
+```
+
+返回结果新增：
+
+```json
+{
+  "retrieval_strategy": "hybrid_rerank",
+  "query_terms": ["rag", "知识", "知识库"],
+  "results": [
+    {
+      "score": 0.72,
+      "vector_score": 0.66,
+      "lexical_score": 0.84,
+      "rerank_score": 0.72
+    }
+  ]
+}
+```
+
+分数含义：
+
+```text
+vector_score   向量相似度
+lexical_score  关键词、短语、标题、章节命中分
+rerank_score   最终排序分，也是 score_threshold 使用的分数
+```
+
+这一步不需要新增 API Key。后续如果要进一步提升效果，可以接入真实 reranker 模型，例如 bge-reranker、Qwen Reranker 或 Cohere Rerank。
 
 ## v1.5 异步入库任务队列
 

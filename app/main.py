@@ -40,7 +40,7 @@ DOCUMENTS_FILE = DATA_DIR / "documents.json"
 DATABASE_FILE = DATA_DIR / "rag_agent.db"
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf"}
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 EMBEDDING_DIM = 256
 TARGET_CHUNK_SIZE = 1200
 MAX_CHUNK_SIZE = 1800
@@ -52,6 +52,8 @@ DETAIL_MAX_CHUNKS = 20
 SEARCH_TOP_K_DEFAULT = 5
 SEARCH_TOP_K_MAX = 20
 SEARCH_SCORE_THRESHOLD_DEFAULT = 0.2
+RERANK_CANDIDATE_MULTIPLIER = 6
+RERANK_CANDIDATE_MAX = 80
 
 ChunkStrategy = Literal[
     "semantic",
@@ -210,6 +212,9 @@ class SearchResult(BaseModel):
     chunk_index: int
     title: str = ""
     score: float
+    vector_score: float = 0.0
+    lexical_score: float = 0.0
+    rerank_score: float = 0.0
     content: str
     char_count: int
     strategy: ChunkStrategy
@@ -226,6 +231,8 @@ class SearchResponse(BaseModel):
     total_chunks: int
     results: list[SearchResult]
     mode: Literal["chroma", "local_hash_embedding"]
+    retrieval_strategy: Literal["hybrid_rerank"] = "hybrid_rerank"
+    query_terms: list[str] = Field(default_factory=list)
 
 
 class VectorStoreStatusResponse(BaseModel):
@@ -1071,6 +1078,98 @@ def cosine_similarity(left: list[float], right: list[float]) -> float:
     return sum(a * b for a, b in zip(left, right))
 
 
+def normalize_search_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text.lower()).strip()
+
+
+def extract_search_terms(text: str) -> list[str]:
+    normalized = normalize_search_text(text)
+    latin_terms = re.findall(r"[a-z0-9][a-z0-9_+#.-]{1,}", normalized)
+    chinese_chars = re.findall(r"[\u4e00-\u9fff]", normalized)
+    chinese_bigrams = [
+        f"{left}{right}" for left, right in zip(chinese_chars, chinese_chars[1:])
+    ]
+    chinese_trigrams = [
+        "".join(chinese_chars[index : index + 3])
+        for index in range(max(len(chinese_chars) - 2, 0))
+    ]
+
+    terms: list[str] = []
+    seen: set[str] = set()
+    for term in latin_terms + chinese_bigrams + chinese_trigrams:
+        if len(term) < 2 or term in seen:
+            continue
+        seen.add(term)
+        terms.append(term)
+
+    return terms[:80]
+
+
+def lexical_rerank_score(question: str, result: SearchResult, query_terms: list[str]) -> float:
+    if not query_terms:
+        return 0.0
+
+    content = normalize_search_text(result.content)
+    title = normalize_search_text(result.title)
+    section = normalize_search_text(" ".join(result.section_path))
+    filename = normalize_search_text(result.document_filename)
+    searchable = f"{filename} {title} {section} {content}"
+
+    weighted_hits = 0.0
+    possible_weight = 0.0
+    for term in query_terms:
+        term_weight = 1.0 + min(len(term), 8) / 8
+        possible_weight += term_weight
+        if term in searchable:
+            weighted_hits += term_weight
+            if term in title:
+                weighted_hits += 0.35
+            if term in section:
+                weighted_hits += 0.25
+            if term in filename:
+                weighted_hits += 0.15
+
+    coverage_score = weighted_hits / max(possible_weight, 1.0)
+
+    phrase_score = 0.0
+    normalized_question = normalize_search_text(question)
+    if len(normalized_question) >= 4 and normalized_question in searchable:
+        phrase_score = 1.0
+
+    return round(max(0.0, min(1.0, coverage_score * 0.82 + phrase_score * 0.18)), 6)
+
+
+def apply_hybrid_rerank(
+    *, question: str, results: list[SearchResult], query_terms: list[str]
+) -> list[SearchResult]:
+    reranked: list[SearchResult] = []
+
+    for result in results:
+        vector_score = result.vector_score or result.score
+        lexical_score = lexical_rerank_score(question, result, query_terms)
+        structural_boost = 0.0
+        if result.title:
+            structural_boost += 0.025
+        if result.section_path:
+            structural_boost += 0.025
+
+        rerank_score = min(
+            1.0,
+            max(0.0, vector_score * 0.72 + lexical_score * 0.28 + structural_boost),
+        )
+        result.vector_score = round(vector_score, 6)
+        result.lexical_score = lexical_score
+        result.rerank_score = round(rerank_score, 6)
+        result.score = result.rerank_score
+        reranked.append(result)
+
+    return sorted(
+        reranked,
+        key=lambda item: (item.rerank_score, item.lexical_score, item.vector_score),
+        reverse=True,
+    )
+
+
 def semantic_threshold(similarities: list[float]) -> float:
     if not similarities:
         return 0.0
@@ -1391,55 +1490,69 @@ def delete_data_file(relative_file_path: str) -> str | None:
 
 def search_chunks(request: SearchRequest) -> SearchResponse:
     question_embedding = embed_text(request.question)
+    query_terms = extract_search_terms(request.question)
+    candidate_top_k = min(
+        RERANK_CANDIDATE_MAX,
+        max(request.top_k, request.top_k * RERANK_CANDIDATE_MULTIPLIER),
+    )
+
     if chroma_available():
         try:
-            raw_chroma_results = query_chunks(question_embedding, request.top_k)
-            chroma_results = [
-                item
-                for item in raw_chroma_results
-                if float(item["score"]) >= request.score_threshold
-            ]
+            raw_chroma_results = query_chunks(question_embedding, candidate_top_k)
             if raw_chroma_results:
+                candidate_results = [
+                    SearchResult(
+                        document_id=str(item["metadata"].get("document_id") or ""),
+                        document_filename=str(
+                            item["metadata"].get("document_filename") or ""
+                        ),
+                        chunk_id=str(item["metadata"].get("chunk_id") or item["chunk_id"]),
+                        chunk_index=int(item["metadata"].get("chunk_index") or 0),
+                        title=str(item["metadata"].get("title") or ""),
+                        score=float(item["score"]),
+                        vector_score=float(item["score"]),
+                        content=str(item.get("content") or ""),
+                        char_count=int(item["metadata"].get("char_count") or 0),
+                        strategy=item["metadata"].get("strategy") or "length_fallback",
+                        section_path=[
+                            part.strip()
+                            for part in str(
+                                item["metadata"].get("section_path") or ""
+                            ).split("/")
+                            if part.strip()
+                        ],
+                        token_estimate=int(item["metadata"].get("token_estimate") or 0),
+                        page_start=(
+                            int(item["metadata"]["page_start"])
+                            if item["metadata"].get("page_start") is not None
+                            else None
+                        ),
+                        page_end=(
+                            int(item["metadata"]["page_end"])
+                            if item["metadata"].get("page_end") is not None
+                            else None
+                        ),
+                    )
+                    for item in raw_chroma_results
+                ]
+                reranked_results = apply_hybrid_rerank(
+                    question=request.question,
+                    results=candidate_results,
+                    query_terms=query_terms,
+                )
+                filtered_results = [
+                    item
+                    for item in reranked_results
+                    if item.score >= request.score_threshold
+                ]
                 return SearchResponse(
                     question=request.question,
                     top_k=request.top_k,
                     score_threshold=request.score_threshold,
                     total_chunks=get_vector_store_status()["chunk_count"],
-                    results=[
-                        SearchResult(
-                            document_id=str(item["metadata"].get("document_id") or ""),
-                            document_filename=str(
-                                item["metadata"].get("document_filename") or ""
-                            ),
-                            chunk_id=str(item["metadata"].get("chunk_id") or item["chunk_id"]),
-                            chunk_index=int(item["metadata"].get("chunk_index") or 0),
-                            title=str(item["metadata"].get("title") or ""),
-                            score=float(item["score"]),
-                            content=str(item.get("content") or ""),
-                            char_count=int(item["metadata"].get("char_count") or 0),
-                            strategy=item["metadata"].get("strategy") or "length_fallback",
-                            section_path=[
-                                part.strip()
-                                for part in str(
-                                    item["metadata"].get("section_path") or ""
-                                ).split("/")
-                                if part.strip()
-                            ],
-                            token_estimate=int(item["metadata"].get("token_estimate") or 0),
-                            page_start=(
-                                int(item["metadata"]["page_start"])
-                                if item["metadata"].get("page_start") is not None
-                                else None
-                            ),
-                            page_end=(
-                                int(item["metadata"]["page_end"])
-                                if item["metadata"].get("page_end") is not None
-                                else None
-                            ),
-                        )
-                        for item in chroma_results
-                    ],
+                    results=filtered_results[: request.top_k],
                     mode="chroma",
+                    query_terms=query_terms[:24],
                 )
         except Exception:
             pass
@@ -1463,6 +1576,7 @@ def search_chunks(request: SearchRequest) -> SearchResponse:
                     chunk_index=chunk.index,
                     title=chunk.title,
                     score=round(score, 6),
+                    vector_score=round(score, 6),
                     content=chunk.content,
                     char_count=chunk.char_count,
                     strategy=chunk.strategy,
@@ -1473,7 +1587,11 @@ def search_chunks(request: SearchRequest) -> SearchResponse:
                 )
             )
 
-    ranked_results = sorted(results, key=lambda item: item.score, reverse=True)
+    ranked_results = apply_hybrid_rerank(
+        question=request.question,
+        results=results,
+        query_terms=query_terms,
+    )
     filtered_results = [
         item for item in ranked_results if item.score >= request.score_threshold
     ]
@@ -1484,6 +1602,7 @@ def search_chunks(request: SearchRequest) -> SearchResponse:
         total_chunks=total_chunks,
         results=filtered_results[: request.top_k],
         mode="local_hash_embedding",
+        query_terms=query_terms[:24],
     )
 
 
