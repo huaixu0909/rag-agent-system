@@ -12,21 +12,33 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
+from app.embeddings import embed_text, embedding_provider
+from app.rag_graph import NO_ENOUGH_CONTEXT_ANSWER, run_langgraph_rag_chat
+from app.rag_chain import generate_rag_answer_with_langchain
+from app.vector_store import (
+    chroma_available,
+    delete_document_chunks,
+    get_status as get_vector_store_status,
+    query_chunks,
+    reset_collection,
+    upsert_document_chunks,
+)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 PARSED_DIR = DATA_DIR / "parsed"
 CHUNKS_DIR = DATA_DIR / "chunks"
+CHROMA_DIR = DATA_DIR / "chroma"
 DOCUMENTS_FILE = DATA_DIR / "documents.json"
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf"}
 
-APP_VERSION = "0.8.0"
+APP_VERSION = "1.3.0"
 EMBEDDING_DIM = 256
 TARGET_CHUNK_SIZE = 1200
 MAX_CHUNK_SIZE = 1800
@@ -37,6 +49,7 @@ DETAIL_PREVIEW_CHARS = 1200
 DETAIL_MAX_CHUNKS = 20
 SEARCH_TOP_K_DEFAULT = 5
 SEARCH_TOP_K_MAX = 20
+SEARCH_SCORE_THRESHOLD_DEFAULT = 0.2
 
 ChunkStrategy = Literal[
     "semantic",
@@ -85,6 +98,30 @@ class DocumentRecord(BaseModel):
     created_at: str
 
 
+class DocumentListResponse(BaseModel):
+    items: list[DocumentRecord]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+    total_chunks: int
+
+
+class UploadProgressItem(BaseModel):
+    filename: str
+    status: Literal["indexed", "failed"]
+    stage: Literal["uploaded", "parsing", "chunking", "embedding", "indexed", "failed"]
+    document: DocumentRecord | None = None
+    error: str = ""
+
+
+class BatchUploadResponse(BaseModel):
+    total: int
+    succeeded: int
+    failed: int
+    items: list[UploadProgressItem]
+
+
 class DocumentChunk(BaseModel):
     id: str
     document_id: str
@@ -102,6 +139,7 @@ class DocumentChunk(BaseModel):
     overlap_previous: str = ""
     overlap_next: str = ""
     embedding: list[float] = Field(default_factory=list)
+    embedding_provider: str = "local_hash"
 
 
 class DocumentDetail(BaseModel):
@@ -122,6 +160,7 @@ class DeleteDocumentResponse(BaseModel):
 class SearchRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
     top_k: int = Field(default=SEARCH_TOP_K_DEFAULT, ge=1, le=SEARCH_TOP_K_MAX)
+    score_threshold: float = Field(default=SEARCH_SCORE_THRESHOLD_DEFAULT, ge=0.0, le=1.0)
 
 
 class SearchResult(BaseModel):
@@ -143,14 +182,32 @@ class SearchResult(BaseModel):
 class SearchResponse(BaseModel):
     question: str
     top_k: int
+    score_threshold: float
     total_chunks: int
     results: list[SearchResult]
-    mode: Literal["local_hash_embedding"]
+    mode: Literal["chroma", "local_hash_embedding"]
+
+
+class VectorStoreStatusResponse(BaseModel):
+    provider: Literal["chroma"]
+    available: bool
+    persist_path: str
+    collection: str
+    chunk_count: int
+    embedding_provider: str = "local_hash"
+
+
+class VectorStoreRebuildResponse(BaseModel):
+    rebuilt: bool
+    provider: Literal["chroma"]
+    document_count: int
+    chunk_count: int
 
 
 class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
     top_k: int = Field(default=SEARCH_TOP_K_DEFAULT, ge=1, le=SEARCH_TOP_K_MAX)
+    score_threshold: float = Field(default=SEARCH_SCORE_THRESHOLD_DEFAULT, ge=0.0, le=1.0)
 
 
 class Source(BaseModel):
@@ -167,7 +224,11 @@ class Source(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     sources: list[Source]
-    mode: Literal["deepseek", "retrieval_template"]
+    mode: Literal["langgraph_deepseek", "langchain_deepseek", "deepseek", "retrieval_template"]
+    retrieval_mode: Literal["chroma", "local_hash_embedding"] = "local_hash_embedding"
+    score_threshold: float = SEARCH_SCORE_THRESHOLD_DEFAULT
+    workflow: Literal["langgraph", "manual"] = "manual"
+    graph_path: list[str] = Field(default_factory=list)
 
 
 @dataclass
@@ -191,6 +252,7 @@ def ensure_data_dirs() -> None:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     PARSED_DIR.mkdir(parents=True, exist_ok=True)
     CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
+    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
     if not DOCUMENTS_FILE.exists():
         DOCUMENTS_FILE.write_text("[]", encoding="utf-8")
 
@@ -211,6 +273,28 @@ def save_documents(documents: list[DocumentRecord]) -> None:
     DOCUMENTS_FILE.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
+    )
+
+
+def sorted_documents() -> list[DocumentRecord]:
+    return sorted(load_documents(), key=lambda document: document.created_at, reverse=True)
+
+
+def build_document_list_response(page: int, page_size: int) -> DocumentListResponse:
+    documents = sorted_documents()
+    total = len(documents)
+    total_pages = max(1, math.ceil(total / page_size))
+    safe_page = min(page, total_pages)
+    start = (safe_page - 1) * page_size
+    end = start + page_size
+
+    return DocumentListResponse(
+        items=documents[start:end],
+        total=total,
+        page=safe_page,
+        page_size=page_size,
+        total_pages=total_pages,
+        total_chunks=sum(document.chunk_count for document in documents),
     )
 
 
@@ -512,31 +596,6 @@ def build_semantic_units(text: str) -> list[SemanticUnit]:
     return units
 
 
-def stable_hash_index(token: str) -> int:
-    digest = hashlib.md5(token.encode("utf-8")).hexdigest()
-    return int(digest[:8], 16) % EMBEDDING_DIM
-
-
-def text_tokens(text: str) -> list[str]:
-    lowered = text.lower()
-    words = re.findall(r"[a-z0-9]+", lowered)
-    chinese_chars = re.findall(r"[\u4e00-\u9fff]", text)
-    chinese_bigrams = [f"{a}{b}" for a, b in zip(chinese_chars, chinese_chars[1:])]
-    return words + chinese_chars + chinese_bigrams
-
-
-def embed_text(text: str) -> list[float]:
-    vector = [0.0] * EMBEDDING_DIM
-    for token in text_tokens(text):
-        vector[stable_hash_index(token)] += 1.0
-
-    norm = math.sqrt(sum(value * value for value in vector))
-    if norm == 0:
-        return vector
-
-    return [value / norm for value in vector]
-
-
 def cosine_similarity(left: list[float], right: list[float]) -> float:
     return sum(a * b for a, b in zip(left, right))
 
@@ -601,6 +660,7 @@ def build_chunk(
         page_start=page_start,
         page_end=page_end,
         embedding=embed_text(clean_content),
+        embedding_provider=embedding_provider(),
     )
 
 
@@ -770,6 +830,7 @@ def apply_chunk_overlaps(chunks: list[DocumentChunk]) -> None:
             if item
         )
         chunk.embedding = embed_text(embedding_text)
+        chunk.embedding_provider = embedding_provider()
 
 
 def save_parsed_text(document_id: str, text: str) -> Path:
@@ -804,7 +865,9 @@ def load_chunks(document: DocumentRecord) -> list[DocumentChunk]:
         chunk = DocumentChunk(**item)
         if chunk.token_estimate == 0:
             chunk.token_estimate = estimate_tokens(chunk.content)
-        if not chunk.embedding:
+        if not chunk.embedding or chunk.embedding_provider != embedding_provider():
+            chunk.embedding = embed_text(chunk.content)
+            chunk.embedding_provider = embedding_provider()
             changed = True
         chunks.append(chunk)
 
@@ -857,6 +920,59 @@ def delete_data_file(relative_file_path: str) -> str | None:
 
 def search_chunks(request: SearchRequest) -> SearchResponse:
     question_embedding = embed_text(request.question)
+    if chroma_available():
+        try:
+            raw_chroma_results = query_chunks(question_embedding, request.top_k)
+            chroma_results = [
+                item
+                for item in raw_chroma_results
+                if float(item["score"]) >= request.score_threshold
+            ]
+            if raw_chroma_results:
+                return SearchResponse(
+                    question=request.question,
+                    top_k=request.top_k,
+                    score_threshold=request.score_threshold,
+                    total_chunks=get_vector_store_status()["chunk_count"],
+                    results=[
+                        SearchResult(
+                            document_id=str(item["metadata"].get("document_id") or ""),
+                            document_filename=str(
+                                item["metadata"].get("document_filename") or ""
+                            ),
+                            chunk_id=str(item["metadata"].get("chunk_id") or item["chunk_id"]),
+                            chunk_index=int(item["metadata"].get("chunk_index") or 0),
+                            title=str(item["metadata"].get("title") or ""),
+                            score=float(item["score"]),
+                            content=str(item.get("content") or ""),
+                            char_count=int(item["metadata"].get("char_count") or 0),
+                            strategy=item["metadata"].get("strategy") or "length_fallback",
+                            section_path=[
+                                part.strip()
+                                for part in str(
+                                    item["metadata"].get("section_path") or ""
+                                ).split("/")
+                                if part.strip()
+                            ],
+                            token_estimate=int(item["metadata"].get("token_estimate") or 0),
+                            page_start=(
+                                int(item["metadata"]["page_start"])
+                                if item["metadata"].get("page_start") is not None
+                                else None
+                            ),
+                            page_end=(
+                                int(item["metadata"]["page_end"])
+                                if item["metadata"].get("page_end") is not None
+                                else None
+                            ),
+                        )
+                        for item in chroma_results
+                    ],
+                    mode="chroma",
+                )
+        except Exception:
+            pass
+
     documents = load_documents()
     results: list[SearchResult] = []
     total_chunks = 0
@@ -887,11 +1003,15 @@ def search_chunks(request: SearchRequest) -> SearchResponse:
             )
 
     ranked_results = sorted(results, key=lambda item: item.score, reverse=True)
+    filtered_results = [
+        item for item in ranked_results if item.score >= request.score_threshold
+    ]
     return SearchResponse(
         question=request.question,
         top_k=request.top_k,
+        score_threshold=request.score_threshold,
         total_chunks=total_chunks,
-        results=ranked_results[: request.top_k],
+        results=filtered_results[: request.top_k],
         mode="local_hash_embedding",
     )
 
@@ -1011,35 +1131,113 @@ def call_deepseek_chat(question: str, results: list[SearchResult]) -> str | None
     return answer or None
 
 
-@app.get("/")
-def read_root() -> dict[str, str]:
-    return {
-        "name": "RAG Agent System MVP",
-        "status": "running",
-        "version": APP_VERSION,
-        "docs": "http://localhost:8000/docs",
-        "health": "http://localhost:8000/health",
-    }
-
-
-@app.get("/health", response_model=HealthResponse)
-def health_check() -> HealthResponse:
-    return HealthResponse(
-        status="ok",
-        service="rag-agent-system",
-        version=APP_VERSION,
-        timestamp=datetime.now(timezone.utc).isoformat(),
+def build_retrieval_template_answer(question: str, results: list[SearchResult]) -> str:
+    summary_lines = [
+        f"{index}. 《{item.document_filename}》chunk {item.chunk_index}，相似度 {item.score:.3f}"
+        for index, item in enumerate(results, start=1)
+    ]
+    return (
+        "已完成知识库检索，但没有成功调用 LLM。以下是可作为回答依据的命中文档片段：\n"
+        + "\n".join(summary_lines)
+        + f"\n\n用户问题：{question}"
     )
 
 
-@app.post("/api/documents/upload", response_model=DocumentRecord)
-async def upload_document(file: UploadFile = File(...)) -> DocumentRecord:
+def build_rag_prompt(question: str, results: list[SearchResult]) -> str:
+    context_blocks = []
+    for index, item in enumerate(results, start=1):
+        page_text = "无页码"
+        if item.page_start:
+            page_text = f"第 {item.page_start} 页"
+            if item.page_end and item.page_end != item.page_start:
+                page_text = f"第 {item.page_start}-{item.page_end} 页"
+
+        section_text = " / ".join(item.section_path) if item.section_path else "未识别章节"
+        context_blocks.append(
+            "\n".join(
+                [
+                    f"[来源 {index}]",
+                    f"文档：{item.document_filename}",
+                    f"chunk：{item.chunk_index}",
+                    f"相似度：{item.score:.3f}",
+                    f"章节：{section_text}",
+                    f"页码：{page_text}",
+                    "内容：",
+                    item.content,
+                ]
+            )
+        )
+
+    return (
+        "你是一个严谨的中文知识库问答助手。请只根据给定资料回答用户问题。\n"
+        "如果资料不足，请明确回答：当前知识库中没有足够信息回答这个问题。\n"
+        "禁止使用资料之外的知识补全答案，禁止编造。\n"
+        "回答必须先给结论，再给依据，并在依据中引用来源编号。\n\n"
+        f"用户问题：\n{question}\n\n"
+        "参考资料：\n"
+        + "\n\n".join(context_blocks)
+    )
+
+
+def call_deepseek_chat(question: str, results: list[SearchResult]) -> str | None:
+    load_env_file()
+    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+    model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    url = f"{base_url}/chat/completions"
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是可靠的 RAG 问答助手，只能基于参考资料回答，并必须引用来源编号。",
+            },
+            {
+                "role": "user",
+                "content": build_rag_prompt(question, results),
+            },
+        ],
+        "temperature": 0.2,
+        "max_tokens": 1200,
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        url=url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return None
+
+    choices = data.get("choices") or []
+    if not choices:
+        return None
+
+    message = choices[0].get("message") or {}
+    answer = str(message.get("content") or "").strip()
+    return answer or None
+
+
+async def ingest_upload_file(file: UploadFile) -> DocumentRecord:
     ensure_data_dirs()
 
     original_filename = safe_filename(repair_mojibake_filename(file.filename or ""))
     extension = Path(original_filename).suffix.lower()
 
     if extension not in SUPPORTED_EXTENSIONS:
+        await file.close()
         raise HTTPException(
             status_code=400,
             detail="Only .txt, .md, and .pdf files are supported.",
@@ -1075,6 +1273,11 @@ async def upload_document(file: UploadFile = File(...)) -> DocumentRecord:
         created_at=datetime.now(timezone.utc).isoformat(),
     )
 
+    try:
+        upsert_document_chunks(document, chunks)
+    except Exception:
+        pass
+
     documents = load_documents()
     documents.append(document)
     save_documents(documents)
@@ -1082,9 +1285,136 @@ async def upload_document(file: UploadFile = File(...)) -> DocumentRecord:
     return document
 
 
-@app.get("/api/documents", response_model=list[DocumentRecord])
-def list_documents() -> list[DocumentRecord]:
-    return sorted(load_documents(), key=lambda document: document.created_at, reverse=True)
+@app.get("/")
+def read_root() -> dict[str, str]:
+    return {
+        "name": "RAG Agent System MVP",
+        "status": "running",
+        "version": APP_VERSION,
+        "docs": "http://localhost:8000/docs",
+        "health": "http://localhost:8000/health",
+    }
+
+
+@app.get("/health", response_model=HealthResponse)
+def health_check() -> HealthResponse:
+    return HealthResponse(
+        status="ok",
+        service="rag-agent-system",
+        version=APP_VERSION,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+@app.post("/api/documents/upload", response_model=DocumentRecord)
+async def upload_document(file: UploadFile = File(...)) -> DocumentRecord:
+    return await ingest_upload_file(file)
+
+
+@app.post("/api/documents/upload/batch", response_model=BatchUploadResponse)
+async def upload_documents_batch(files: list[UploadFile] = File(...)) -> BatchUploadResponse:
+    if not files:
+        raise HTTPException(status_code=400, detail="No files were uploaded.")
+
+    items: list[UploadProgressItem] = []
+
+    for file in files:
+        filename = safe_filename(repair_mojibake_filename(file.filename or ""))
+
+        try:
+            document = await ingest_upload_file(file)
+            items.append(
+                UploadProgressItem(
+                    filename=document.filename,
+                    status="indexed",
+                    stage="indexed",
+                    document=document,
+                )
+            )
+        except HTTPException as exc:
+            items.append(
+                UploadProgressItem(
+                    filename=filename,
+                    status="failed",
+                    stage="failed",
+                    error=str(exc.detail),
+                )
+            )
+        except Exception as exc:
+            items.append(
+                UploadProgressItem(
+                    filename=filename,
+                    status="failed",
+                    stage="failed",
+                    error=str(exc),
+                )
+            )
+
+    succeeded = sum(1 for item in items if item.status == "indexed")
+
+    return BatchUploadResponse(
+        total=len(items),
+        succeeded=succeeded,
+        failed=len(items) - succeeded,
+        items=items,
+    )
+
+
+@app.get("/api/documents", response_model=DocumentListResponse)
+def list_documents(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=10, ge=1, le=100),
+) -> DocumentListResponse:
+    return build_document_list_response(page, page_size)
+
+
+@app.get("/api/vector-store/status", response_model=VectorStoreStatusResponse)
+def vector_store_status() -> VectorStoreStatusResponse:
+    if not chroma_available():
+        return VectorStoreStatusResponse(
+            provider="chroma",
+            available=False,
+            persist_path="data/chroma",
+            collection="rag_chunks",
+            chunk_count=0,
+            embedding_provider=embedding_provider(),
+        )
+
+    try:
+        status = get_vector_store_status()
+    except Exception:
+        return VectorStoreStatusResponse(
+            provider="chroma",
+            available=False,
+            persist_path="data/chroma",
+            collection="rag_chunks",
+            chunk_count=0,
+            embedding_provider=embedding_provider(),
+        )
+
+    return VectorStoreStatusResponse(**status, embedding_provider=embedding_provider())
+
+
+@app.post("/api/vector-store/rebuild", response_model=VectorStoreRebuildResponse)
+def rebuild_vector_store() -> VectorStoreRebuildResponse:
+    if not chroma_available():
+        raise HTTPException(status_code=503, detail="Chroma is not available")
+
+    reset_collection()
+    documents = load_documents()
+    chunk_count = 0
+
+    for document in documents:
+        chunks = load_chunks(document)
+        if chunks:
+            chunk_count += upsert_document_chunks(document, chunks)
+
+    return VectorStoreRebuildResponse(
+        rebuilt=True,
+        provider="chroma",
+        document_count=len(documents),
+        chunk_count=chunk_count,
+    )
 
 
 @app.delete("/api/documents/{document_id}", response_model=DeleteDocumentResponse)
@@ -1094,6 +1424,11 @@ def delete_document(document_id: str) -> DeleteDocumentResponse:
 
     if document is None:
         raise HTTPException(status_code=404, detail="Document not found")
+
+    try:
+        delete_document_chunks(document.id)
+    except Exception:
+        pass
 
     removed_files = [
         removed
@@ -1178,10 +1513,14 @@ def chat_template_disabled(request: ChatRequest) -> ChatResponse:
     )
 
 
-@app.post("/api/chat", response_model=ChatResponse)
+@app.post("/api/chat-legacy-disabled", response_model=ChatResponse, include_in_schema=False)
 def chat(request: ChatRequest) -> ChatResponse:
     search_response = search_chunks(
-        SearchRequest(question=request.question, top_k=request.top_k)
+        SearchRequest(
+            question=request.question,
+            top_k=request.top_k,
+            score_threshold=request.score_threshold,
+        )
     )
 
     if not search_response.results:
@@ -1192,6 +1531,18 @@ def chat(request: ChatRequest) -> ChatResponse:
         )
 
     sources = build_sources(search_response.results)
+    langchain_answer = generate_rag_answer_with_langchain(
+        question=request.question,
+        chunks=[item.model_dump() for item in search_response.results],
+    )
+
+    if langchain_answer:
+        return ChatResponse(
+            answer=langchain_answer,
+            sources=sources,
+            mode="langchain_deepseek",
+        )
+
     answer = call_deepseek_chat(request.question, search_response.results)
 
     if answer:
@@ -1205,4 +1556,90 @@ def chat(request: ChatRequest) -> ChatResponse:
         answer=build_retrieval_template_answer(request.question, search_response.results),
         sources=sources,
         mode="retrieval_template",
+    )
+
+
+@app.post("/api/chat", response_model=ChatResponse)
+def chat_with_strict_rag(request: ChatRequest) -> ChatResponse:
+    graph_result = run_langgraph_rag_chat(
+        question=request.question,
+        top_k=request.top_k,
+        score_threshold=request.score_threshold,
+        search_fn=lambda question, top_k, score_threshold: search_chunks(
+            SearchRequest(
+                question=question,
+                top_k=top_k,
+                score_threshold=score_threshold,
+            )
+        ),
+        build_sources_fn=build_sources,
+        langchain_answer_fn=generate_rag_answer_with_langchain,
+        deepseek_answer_fn=call_deepseek_chat,
+        template_answer_fn=build_retrieval_template_answer,
+    )
+
+    if graph_result is not None:
+        return ChatResponse(
+            answer=graph_result["answer"],
+            sources=graph_result.get("sources", []),
+            mode=graph_result["mode"],
+            retrieval_mode=graph_result.get("retrieval_mode", "local_hash_embedding"),
+            score_threshold=request.score_threshold,
+            workflow="langgraph",
+            graph_path=graph_result.get("graph_path", []),
+        )
+
+    search_response = search_chunks(
+        SearchRequest(
+            question=request.question,
+            top_k=request.top_k,
+            score_threshold=request.score_threshold,
+        )
+    )
+
+    if not search_response.results:
+        return ChatResponse(
+            answer=NO_ENOUGH_CONTEXT_ANSWER,
+            sources=[],
+            mode="retrieval_template",
+            retrieval_mode=search_response.mode,
+            score_threshold=request.score_threshold,
+            workflow="manual",
+        )
+
+    sources = build_sources(search_response.results)
+    langchain_answer = generate_rag_answer_with_langchain(
+        question=request.question,
+        chunks=[item.model_dump() for item in search_response.results],
+    )
+
+    if langchain_answer:
+        return ChatResponse(
+            answer=langchain_answer,
+            sources=sources,
+            mode="langchain_deepseek",
+            retrieval_mode=search_response.mode,
+            score_threshold=request.score_threshold,
+            workflow="manual",
+        )
+
+    answer = call_deepseek_chat(request.question, search_response.results)
+
+    if answer:
+        return ChatResponse(
+            answer=answer,
+            sources=sources,
+            mode="deepseek",
+            retrieval_mode=search_response.mode,
+            score_threshold=request.score_threshold,
+            workflow="manual",
+        )
+
+    return ChatResponse(
+        answer=build_retrieval_template_answer(request.question, search_response.results),
+        sources=sources,
+        mode="retrieval_template",
+        retrieval_mode=search_response.mode,
+        score_threshold=request.score_threshold,
+        workflow="manual",
     )

@@ -2,21 +2,140 @@
 
 企业知识库 RAG Agent 系统最小原型。
 
-当前版本是 `v0.8`，已经支持文档上传、文本解析、结构增强 chunking、chunk embedding 保存、根据用户问题检索最相关 chunks，并通过 DeepSeek API 基于检索结果生成回答。
+当前版本是 `v1.3`，已经支持文档上传、批量上传、上传解析进度反馈、后端分页文档库、文本解析、结构增强 chunking、JSON chunks 留存、Chroma 本地向量库检索、Qwen Embedding、相似度阈值拒答，以及 LangGraph + LangChain + DeepSeek RAG 问答。
 
 ## 当前功能
 
 - FastAPI 后端服务
-- 文档上传接口：`POST /api/documents/upload`
-- 文档列表接口：`GET /api/documents`
+- 单文件上传接口：`POST /api/documents/upload`
+- 批量上传接口：`POST /api/documents/upload/batch`
+- 文档分页列表接口：`GET /api/documents?page=1&page_size=10`
 - 文档详情接口：`GET /api/documents/{document_id}`
 - 文档删除接口：`DELETE /api/documents/{document_id}`
 - 问题检索接口：`POST /api/search`
-- LLM 问答接口：`POST /api/chat`
+- 向量库状态接口：`GET /api/vector-store/status`
+- 向量库重建接口：`POST /api/vector-store/rebuild`
+- LangGraph RAG 问答接口：`POST /api/chat`
 - Swagger API 文档：`GET /docs`
-- 支持个人主页 `http://localhost:3000` 跨域访问
 
-## v0.7 Chunking 流程
+## v1.3 LangGraph RAG Chat
+
+`/api/chat` 现在优先走 LangGraph 工作流：
+
+```text
+START
+-> retrieve            检索 Chroma / JSON fallback
+-> 条件分支
+   -> reject_answer    没有足够相关资料，直接拒答
+   -> generate_answer  有相关资料，调用 LangChain + DeepSeek 生成答案
+-> END
+```
+
+返回结果会包含：
+
+```json
+{
+  "workflow": "langgraph",
+  "graph_path": ["retrieve", "generate_answer"],
+  "mode": "langgraph_deepseek"
+}
+```
+
+如果本地还没有安装 LangGraph，接口会自动回退到原来的手动 RAG 流程，并返回：
+
+```json
+{
+  "workflow": "manual"
+}
+```
+
+安装或更新依赖：
+
+```powershell
+D:\Download\Coding\CondaData\envs_dirs\llm_env\python.exe -m pip install -r requirements.txt
+```
+
+## v1.2 知识库管理体验优化
+
+文档库列表已经改为后端分页，适合后续上传大量资料：
+
+```text
+GET /api/documents?page=1&page_size=10
+```
+
+返回结构：
+
+```json
+{
+  "items": [],
+  "total": 25,
+  "page": 1,
+  "page_size": 10,
+  "total_pages": 3,
+  "total_chunks": 120
+}
+```
+
+批量上传接口：
+
+```text
+POST /api/documents/upload/batch
+```
+
+每个文件都会返回独立状态，前端可以展示上传、解析、入库或失败结果。当前 v1.2 是请求级进度反馈；如果后续要支持超大文件和后台任务，可以升级为任务队列 + 轮询进度。
+
+## v1.0 Chroma 向量数据库
+
+当前检索层已经从“遍历 JSON chunks”升级为：
+
+```text
+上传文档
+-> 解析文本
+-> 结构增强 chunking
+-> 保存 JSON chunks
+-> 写入 Chroma collection
+-> /api/search 优先使用 Chroma similarity search
+-> Chroma 不可用时回退到 JSON 遍历检索
+```
+
+保留 JSON chunks 的原因：
+
+```text
+JSON chunks：可读、可调试、适合文档详情页展示
+Chroma：负责向量相似度检索
+```
+
+本地向量库目录：
+
+```text
+data/chroma
+```
+
+`data/` 已加入 `.gitignore`，Chroma 本地索引不会提交到 GitHub。
+
+## v0.9 LangChain RAG Chat
+
+`/api/chat` 当前执行顺序：
+
+```text
+1. 根据用户问题检索 top_k chunks
+2. 将 chunks、章节路径、页码、相似度整理为 context
+3. 使用 LangChain ChatPromptTemplate 构建 RAG Prompt
+4. 使用 langchain-openai 的 ChatOpenAI 调用 DeepSeek OpenAI-compatible API
+5. 使用 StrOutputParser 输出文本回答
+6. 如果 LangChain 或依赖不可用，降级为旧版 DeepSeek 直连
+7. 如果 DeepSeek 也不可用，降级为 retrieval_template
+```
+
+返回的 `mode`：
+
+```text
+langchain_deepseek   LangChain + DeepSeek 调用成功
+deepseek             旧版 DeepSeek 直连兜底成功
+retrieval_template   LLM 不可用，返回检索模板回答
+```
+
+## Chunking 流程
 
 ```text
 1. 上传 .txt / .md / .pdf 文档
@@ -26,22 +145,55 @@
 5. 优先按章节边界切分，章节过长时再做语义二次切分
 6. 给相邻 chunk 保存 overlap_previous / overlap_next
 7. 为 chunk + overlap 生成本地哈希 embedding
-8. 用户提交问题后，计算 question embedding 和 chunk embedding 的余弦相似度
-9. 返回相似度最高的 top_k 个 chunks
+8. 写入 JSON chunks 和 Chroma
 ```
 
-当前 embedding 是本地哈希向量，适合 MVP 验证流程。它不是生产级语义模型，后续可以替换为 `bge-small-zh`、Qwen Embedding、OpenAI Embedding，或写入 Qdrant / Chroma。
+当前 embedding 是本地哈希向量，适合 MVP 验证流程。它不是生产级语义模型，后续可以替换为 `bge-small-zh`、Qwen Embedding、OpenAI Embedding。
 
-## v0.8 LLM 问答流程
+## v1.1 Qwen Embedding 与严格检索
+
+系统现在支持 Qwen Embedding。配置 API Key 后，上传和重建索引会优先使用 Qwen 生成 embedding；未配置时自动回退本地哈希 embedding。
+
+`.env` 配置示例：
+
+```env
+DASHSCOPE_API_KEY=你的 DashScope API Key
+QWEN_EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+QWEN_EMBEDDING_MODEL=text-embedding-v4
+QWEN_EMBEDDING_DIMENSIONS=1024
+```
+
+也可以使用：
+
+```env
+QWEN_EMBEDDING_API_KEY=你的 DashScope API Key
+```
+
+配置 Qwen Embedding 后，请执行一次：
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8000/api/vector-store/rebuild" -Method Post
+```
+
+这样已有 JSON chunks 会重新生成 Qwen embedding 并写入 Chroma。
+
+检索和问答支持相似度阈值：
+
+```json
+{
+  "question": "这个文档里和项目经验相关的内容是什么？",
+  "top_k": 5,
+  "score_threshold": 0.2
+}
+```
+
+如果没有任何 chunk 达到阈值，`/api/chat` 会直接返回：
 
 ```text
-1. 用户提交问题和 top_k
-2. 后端用 /api/search 同一套逻辑检索相关 chunks
-3. 将问题、chunks、章节路径、页码和相似度拼入 RAG Prompt
-4. 调用 DeepSeek Chat Completions
-5. 返回 answer、sources 和 mode
-6. 如果没有配置 API Key 或调用失败，自动降级为 retrieval_template
+当前知识库中没有足够信息回答这个问题。
 ```
+
+## 环境变量
 
 `.env` 配置：
 
@@ -49,32 +201,40 @@
 DEEPSEEK_API_KEY=你的 DeepSeek API Key
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-chat
+DASHSCOPE_API_KEY=你的 DashScope API Key
+QWEN_EMBEDDING_MODEL=text-embedding-v4
 ```
 
 `.env` 已加入 `.gitignore`，不要提交到 GitHub。
 
-## Chunk 字段
+## API 示例
 
-```text
-id                    chunk id
-document_id           所属文档 id
-index                 chunk 序号
-content               chunk 正文
-char_count            字符数
-token_estimate        token 粗略估算
-title                 最近标题
-heading_level         标题层级
-section_path          章节路径
-page_start            起始页码
-page_end              结束页码
-strategy              section_semantic / section_semantic_split / length_fallback
-semantic_break_score  与前一语义单元的相似度
-overlap_previous      上一个 chunk 的尾部上下文
-overlap_next          下一个 chunk 的头部上下文
-embedding             本地哈希向量
+### 查询向量库状态
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8000/api/vector-store/status" -Method Get
 ```
 
-## API 示例
+返回示例：
+
+```json
+{
+  "provider": "chroma",
+  "available": true,
+  "persist_path": "data/chroma",
+  "collection": "rag_chunks",
+  "chunk_count": 12,
+  "embedding_provider": "qwen"
+}
+```
+
+### 重建向量库
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8000/api/vector-store/rebuild" -Method Post
+```
+
+用于把已有 `data/chunks/*.json` 重新写入 Chroma。
 
 ### 上传文档
 
@@ -85,21 +245,25 @@ Invoke-RestMethod `
   -Form @{ file = Get-Item "D:\path\to\demo.pdf" }
 ```
 
-### 查询文档列表
-
-```powershell
-Invoke-RestMethod -Uri "http://localhost:8000/api/documents" -Method Get
-```
-
-### 删除文档
+### 批量上传文档
 
 ```powershell
 Invoke-RestMethod `
-  -Uri "http://localhost:8000/api/documents/doc_xxxxxxxxxxxx" `
-  -Method Delete
+  -Uri "http://localhost:8000/api/documents/upload/batch" `
+  -Method Post `
+  -Form @{
+    files = @(
+      Get-Item "D:\path\to\a.pdf"
+      Get-Item "D:\path\to\b.md"
+    )
+  }
 ```
 
-删除会同时移除文档元数据、原始上传文件、解析文本和 chunks 文件。
+### 分页查看文档库
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8000/api/documents?page=1&page_size=10" -Method Get
+```
 
 ### 根据问题检索 chunks
 
@@ -108,33 +272,30 @@ Invoke-RestMethod `
   -Uri "http://localhost:8000/api/search" `
   -Method Post `
   -ContentType "application/json" `
-  -Body '{"question":"这个文档里和项目经验相关的内容是什么？","top_k":5}'
+  -Body '{"question":"这个文档里和项目经验相关的内容是什么？","top_k":5,"score_threshold":0.2}'
 ```
 
-返回核心字段：
+如果 Chroma 命中，返回：
 
 ```text
-total_chunks              本次扫描的 chunk 总数
-results[].score           问题和 chunk 的相似度
-results[].content         命中的 chunk 内容
-results[].strategy        chunk 切分策略
-results[].section_path    chunk 所属章节路径
-results[].page_start      chunk 起始页
-results[].page_end        chunk 结束页
-results[].token_estimate  token 估算
+mode = chroma
 ```
 
-### 生成模板回答
+如果 Chroma 不可用，会回退：
+
+```text
+mode = local_hash_embedding
+```
+
+### LangChain RAG 问答
 
 ```powershell
 Invoke-RestMethod `
   -Uri "http://localhost:8000/api/chat" `
   -Method Post `
   -ContentType "application/json" `
-  -Body '{"question":"这个文档主要讲了什么？","top_k":5}'
+  -Body '{"question":"这个文档主要讲了什么？","top_k":5,"score_threshold":0.2}'
 ```
-
-如果 DeepSeek 调用成功，返回 `mode=deepseek`。如果没有 API Key 或网络/API 调用失败，返回 `mode=retrieval_template`。
 
 ## 本地运行
 
@@ -157,10 +318,9 @@ http://localhost:8000/docs
 data/uploads        原始上传文件
 data/parsed         解析后的纯文本
 data/chunks         文本切分后的 chunks、metadata、overlap 和 embedding
+data/chroma         Chroma 本地向量库
 data/documents.json 文档元数据
 ```
-
-`data/` 已加入 `.gitignore`，本地测试文档不会被提交到 GitHub。
 
 ## 前端 Demo
 
@@ -174,34 +334,35 @@ http://localhost:3000/demos/rag-agent
 文档上传
 文档删除
 文档列表
+Chroma / JSON fallback 状态
 解析文本预览
 结构增强 chunks
-章节路径
-页码信息
-overlap 上下文
 问题检索结果
-问题和 chunk 的相似度分数
-模板回答和 sources
+回答和 sources
 ```
 
-## v0.7 验收标准
+## v1.0 验收标准
 
-- 上传 `.txt`、`.md`、`.pdf` 后能生成 chunks
-- chunk JSON 中包含 `embedding`
-- chunk JSON 中包含 `section_path`、`token_estimate`、`page_start`、`page_end`
-- chunk JSON 中包含 `overlap_previous` 和 `overlap_next`
-- PDF 文档的页码信息可以进入 chunk metadata
-- 过长章节会被二次切分为 `section_semantic_split`
-- `POST /api/search` 可以返回 top_k 个相似 chunks
-- 检索结果包含文档名、chunk 编号、相似度、章节路径、页码、chunk 内容
-- 个人主页 RAG Demo 可以展示检索结果和 chunk metadata
-- `/api/chat` 能优先调用 DeepSeek 基于检索结果生成回答
-- DeepSeek 不可用时 `/api/chat` 能自动降级为模板回答
+- 上传新文档后，chunks 同时保存到 JSON 和 Chroma
+- `GET /api/vector-store/status` 返回 Chroma 状态
+- `POST /api/vector-store/rebuild` 能把已有 JSON chunks 重建进 Chroma
+- `POST /api/search` 优先返回 `mode=chroma`
+- 删除文档时同步删除 Chroma 中对应 chunks
+- Chroma 不可用时保留 JSON fallback
+- LangChain / DeepSeek 问答链路保持兼容
+
+## v1.1 验收标准
+
+- 配置 `DASHSCOPE_API_KEY` 后，系统优先使用 Qwen Embedding
+- `GET /api/vector-store/status` 返回 `embedding_provider=qwen`
+- `POST /api/vector-store/rebuild` 能用 Qwen embedding 重建 Chroma
+- `/api/search` 支持 `score_threshold`
+- `/api/chat` 在无足够相关资料时返回“当前知识库中没有足够信息回答这个问题。”
+- Prompt 明确要求只基于资料回答，并引用来源编号
 
 ## 后续计划
 
 - 替换为真实 embedding 模型
-- 接入 Qdrant 或 Chroma
 - 为检索增加文档过滤、分数阈值和 rerank
 - 支持流式输出
-- 支持多模型切换
+- 使用 LangGraph 编排多步骤 Agent Workflow
