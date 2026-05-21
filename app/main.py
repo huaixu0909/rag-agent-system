@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
@@ -40,7 +40,7 @@ DOCUMENTS_FILE = DATA_DIR / "documents.json"
 DATABASE_FILE = DATA_DIR / "rag_agent.db"
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf"}
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 EMBEDDING_DIM = 256
 TARGET_CHUNK_SIZE = 1200
 MAX_CHUNK_SIZE = 1800
@@ -122,6 +122,44 @@ class BatchUploadResponse(BaseModel):
     succeeded: int
     failed: int
     items: list[UploadProgressItem]
+
+
+IngestTaskStatus = Literal["queued", "running", "completed", "failed", "partial_failed"]
+IngestFileStatus = Literal["queued", "running", "indexed", "failed"]
+IngestFileStage = Literal[
+    "uploaded",
+    "queued",
+    "parsing",
+    "chunking",
+    "embedding",
+    "indexing",
+    "indexed",
+    "failed",
+]
+
+
+class IngestTaskFileResponse(BaseModel):
+    file_id: str
+    filename: str
+    status: IngestFileStatus
+    stage: IngestFileStage
+    document_id: str = ""
+    document: DocumentRecord | None = None
+    char_count: int = 0
+    chunk_count: int = 0
+    error: str = ""
+
+
+class IngestTaskResponse(BaseModel):
+    task_id: str
+    status: IngestTaskStatus
+    total: int
+    succeeded: int
+    failed: int
+    created_at: str
+    updated_at: str
+    completed_at: str = ""
+    items: list[IngestTaskFileResponse]
 
 
 class DocumentChunk(BaseModel):
@@ -291,6 +329,43 @@ def initialize_database() -> None:
                 value TEXT NOT NULL
             )
             """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ingest_tasks (
+                task_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                total INTEGER NOT NULL DEFAULT 0,
+                succeeded INTEGER NOT NULL DEFAULT 0,
+                failed INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ingest_task_files (
+                file_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                document_id TEXT NOT NULL DEFAULT '',
+                filename TEXT NOT NULL,
+                file_type TEXT NOT NULL DEFAULT '',
+                stored_path TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                char_count INTEGER NOT NULL DEFAULT 0,
+                chunk_count INTEGER NOT NULL DEFAULT 0,
+                error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(task_id) REFERENCES ingest_tasks(task_id)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ingest_task_files_task_id ON ingest_task_files(task_id)"
         )
         connection.commit()
 
@@ -462,6 +537,235 @@ def build_document_list_response(page: int, page_size: int) -> DocumentListRespo
         page_size=page_size,
         total_pages=total_pages,
         total_chunks=sum(document.chunk_count for document in documents),
+    )
+
+
+def create_ingest_task(task_id: str, total: int) -> None:
+    ensure_data_dirs()
+    now = datetime.now(timezone.utc).isoformat()
+    with open_database() as connection:
+        connection.execute(
+            """
+            INSERT INTO ingest_tasks (
+                task_id, status, total, succeeded, failed,
+                created_at, updated_at, completed_at
+            )
+            VALUES (?, ?, ?, 0, 0, ?, ?, '')
+            """,
+            (task_id, "queued", total, now, now),
+        )
+        connection.commit()
+
+
+def create_ingest_task_file(
+    *,
+    file_id: str,
+    task_id: str,
+    document_id: str,
+    filename: str,
+    file_type: str,
+    stored_path: str,
+    status: IngestFileStatus,
+    stage: IngestFileStage,
+    error: str = "",
+) -> None:
+    ensure_data_dirs()
+    now = datetime.now(timezone.utc).isoformat()
+    with open_database() as connection:
+        connection.execute(
+            """
+            INSERT INTO ingest_task_files (
+                file_id, task_id, document_id, filename, file_type,
+                stored_path, status, stage, error, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                file_id,
+                task_id,
+                document_id,
+                filename,
+                file_type,
+                stored_path,
+                status,
+                stage,
+                error,
+                now,
+                now,
+            ),
+        )
+        connection.commit()
+
+
+def update_ingest_task_status(task_id: str, status: IngestTaskStatus) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    completed_at = now if status in {"completed", "failed", "partial_failed"} else ""
+    with open_database() as connection:
+        connection.execute(
+            """
+            UPDATE ingest_tasks
+            SET status = ?, updated_at = ?, completed_at = CASE WHEN ? != '' THEN ? ELSE completed_at END
+            WHERE task_id = ?
+            """,
+            (status, now, completed_at, completed_at, task_id),
+        )
+        connection.commit()
+
+
+def update_ingest_task_file(
+    file_id: str,
+    *,
+    status: IngestFileStatus | None = None,
+    stage: IngestFileStage | None = None,
+    char_count: int | None = None,
+    chunk_count: int | None = None,
+    error: str | None = None,
+) -> None:
+    updates: list[str] = ["updated_at = ?"]
+    values: list[object] = [datetime.now(timezone.utc).isoformat()]
+
+    if status is not None:
+        updates.append("status = ?")
+        values.append(status)
+    if stage is not None:
+        updates.append("stage = ?")
+        values.append(stage)
+    if char_count is not None:
+        updates.append("char_count = ?")
+        values.append(char_count)
+    if chunk_count is not None:
+        updates.append("chunk_count = ?")
+        values.append(chunk_count)
+    if error is not None:
+        updates.append("error = ?")
+        values.append(error)
+
+    values.append(file_id)
+
+    with open_database() as connection:
+        connection.execute(
+            f"UPDATE ingest_task_files SET {', '.join(updates)} WHERE file_id = ?",
+            values,
+        )
+        connection.commit()
+
+
+def refresh_ingest_task_counters(task_id: str) -> None:
+    with open_database() as connection:
+        task = connection.execute(
+            "SELECT status FROM ingest_tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        rows = connection.execute(
+            "SELECT status FROM ingest_task_files WHERE task_id = ?",
+            (task_id,),
+        ).fetchall()
+
+        total = len(rows)
+        succeeded = sum(1 for row in rows if row["status"] == "indexed")
+        failed = sum(1 for row in rows if row["status"] == "failed")
+        running = any(row["status"] == "running" for row in rows)
+        queued = any(row["status"] == "queued" for row in rows)
+
+        current_task_status = str(task["status"]) if task else ""
+
+        if running or (current_task_status == "running" and queued):
+            status = "running"
+        elif queued:
+            status = "queued"
+        elif failed and succeeded:
+            status = "partial_failed"
+        elif failed and not succeeded:
+            status = "failed"
+        else:
+            status = "completed"
+
+        now = datetime.now(timezone.utc).isoformat()
+        completed_at = now if status in {"completed", "failed", "partial_failed"} else ""
+        connection.execute(
+            """
+            UPDATE ingest_tasks
+            SET status = ?, total = ?, succeeded = ?, failed = ?,
+                updated_at = ?, completed_at = CASE WHEN ? != '' THEN ? ELSE completed_at END
+            WHERE task_id = ?
+            """,
+            (status, total, succeeded, failed, now, completed_at, completed_at, task_id),
+        )
+        connection.commit()
+
+
+def get_document_or_none(document_id: str) -> DocumentRecord | None:
+    if not document_id:
+        return None
+
+    with open_database() as connection:
+        row = connection.execute(
+            """
+            SELECT id, filename, file_type, stored_path, parsed_path,
+                   chunks_path, char_count, chunk_count, created_at
+            FROM documents
+            WHERE id = ?
+            """,
+            (document_id,),
+        ).fetchone()
+
+    return document_from_row(row) if row else None
+
+
+def build_ingest_task_response(task_id: str) -> IngestTaskResponse:
+    ensure_data_dirs()
+    refresh_ingest_task_counters(task_id)
+
+    with open_database() as connection:
+        task = connection.execute(
+            """
+            SELECT task_id, status, total, succeeded, failed,
+                   created_at, updated_at, completed_at
+            FROM ingest_tasks
+            WHERE task_id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+
+        if task is None:
+            raise HTTPException(status_code=404, detail="Ingest task not found")
+
+        rows = connection.execute(
+            """
+            SELECT file_id, filename, status, stage, document_id,
+                   char_count, chunk_count, error
+            FROM ingest_task_files
+            WHERE task_id = ?
+            ORDER BY created_at ASC
+            """,
+            (task_id,),
+        ).fetchall()
+
+    items = [
+        IngestTaskFileResponse(
+            file_id=str(row["file_id"]),
+            filename=str(row["filename"]),
+            status=row["status"],
+            stage=row["stage"],
+            document_id=str(row["document_id"] or ""),
+            document=get_document_or_none(str(row["document_id"] or "")),
+            char_count=int(row["char_count"] or 0),
+            chunk_count=int(row["chunk_count"] or 0),
+            error=str(row["error"] or ""),
+        )
+        for row in rows
+    ]
+
+    return IngestTaskResponse(
+        task_id=str(task["task_id"]),
+        status=task["status"],
+        total=int(task["total"] or 0),
+        succeeded=int(task["succeeded"] or 0),
+        failed=int(task["failed"] or 0),
+        created_at=str(task["created_at"]),
+        updated_at=str(task["updated_at"]),
+        completed_at=str(task["completed_at"] or ""),
+        items=items,
     )
 
 
@@ -1450,6 +1754,85 @@ async def ingest_upload_file(file: UploadFile) -> DocumentRecord:
     return document
 
 
+def process_ingest_task(task_id: str) -> None:
+    update_ingest_task_status(task_id, "running")
+
+    with open_database() as connection:
+        rows = connection.execute(
+            """
+            SELECT file_id, document_id, filename, file_type, stored_path
+            FROM ingest_task_files
+            WHERE task_id = ? AND status = ?
+            ORDER BY created_at ASC
+            """,
+            (task_id, "queued"),
+        ).fetchall()
+
+    for row in rows:
+        file_id = str(row["file_id"])
+        document_id = str(row["document_id"])
+        filename = str(row["filename"])
+        extension = str(row["file_type"])
+        stored_path = BASE_DIR / str(row["stored_path"])
+
+        try:
+            update_ingest_task_file(file_id, status="running", stage="parsing")
+            parsed_text = parse_document(stored_path, extension)
+
+            update_ingest_task_file(file_id, stage="chunking")
+            chunks = split_text_into_chunks(parsed_text, document_id)
+
+            parsed_path = save_parsed_text(document_id, parsed_text)
+            chunks_path = save_chunks(document_id, chunks)
+
+            document = DocumentRecord(
+                id=document_id,
+                filename=filename,
+                file_type=extension,
+                stored_path=relative_path(stored_path),
+                parsed_path=relative_path(parsed_path),
+                chunks_path=relative_path(chunks_path),
+                char_count=len(parsed_text),
+                chunk_count=len(chunks),
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
+
+            update_ingest_task_file(
+                file_id,
+                stage="embedding",
+                char_count=document.char_count,
+                chunk_count=document.chunk_count,
+            )
+
+            update_ingest_task_file(file_id, stage="indexing")
+            try:
+                upsert_document_chunks(document, chunks)
+            except Exception:
+                pass
+
+            insert_document_record(document)
+            update_ingest_task_file(
+                file_id,
+                status="indexed",
+                stage="indexed",
+                char_count=document.char_count,
+                chunk_count=document.chunk_count,
+                error="",
+            )
+        except Exception as exc:
+            stored_path.unlink(missing_ok=True)
+            update_ingest_task_file(
+                file_id,
+                status="failed",
+                stage="failed",
+                error=str(exc),
+            )
+        finally:
+            refresh_ingest_task_counters(task_id)
+
+    refresh_ingest_task_counters(task_id)
+
+
 @app.get("/")
 def read_root() -> dict[str, str]:
     return {
@@ -1476,53 +1859,83 @@ async def upload_document(file: UploadFile = File(...)) -> DocumentRecord:
     return await ingest_upload_file(file)
 
 
-@app.post("/api/documents/upload/batch", response_model=BatchUploadResponse)
-async def upload_documents_batch(files: list[UploadFile] = File(...)) -> BatchUploadResponse:
+@app.post("/api/documents/upload/batch", response_model=IngestTaskResponse)
+async def upload_documents_batch(
+    background_tasks: BackgroundTasks,
+    files: list[UploadFile] = File(...),
+) -> IngestTaskResponse:
     if not files:
         raise HTTPException(status_code=400, detail="No files were uploaded.")
 
-    items: list[UploadProgressItem] = []
+    ensure_data_dirs()
+    task_id = f"task_{uuid.uuid4().hex[:12]}"
+    create_ingest_task(task_id, len(files))
+    queued_count = 0
 
     for file in files:
         filename = safe_filename(repair_mojibake_filename(file.filename or ""))
+        extension = Path(filename).suffix.lower()
+        file_id = f"file_{uuid.uuid4().hex[:12]}"
+        document_id = f"doc_{uuid.uuid4().hex[:12]}"
+
+        if extension not in SUPPORTED_EXTENSIONS:
+            await file.close()
+            create_ingest_task_file(
+                file_id=file_id,
+                task_id=task_id,
+                document_id="",
+                filename=filename,
+                file_type=extension,
+                stored_path="",
+                status="failed",
+                stage="failed",
+                error="Only .txt, .md, and .pdf files are supported.",
+            )
+            continue
+
+        stored_path = UPLOAD_DIR / f"{document_id}{extension}"
 
         try:
-            document = await ingest_upload_file(file)
-            items.append(
-                UploadProgressItem(
-                    filename=document.filename,
-                    status="indexed",
-                    stage="indexed",
-                    document=document,
-                )
-            )
-        except HTTPException as exc:
-            items.append(
-                UploadProgressItem(
-                    filename=filename,
-                    status="failed",
-                    stage="failed",
-                    error=str(exc.detail),
-                )
-            )
+            with stored_path.open("wb") as target:
+                shutil.copyfileobj(file.file, target)
         except Exception as exc:
-            items.append(
-                UploadProgressItem(
-                    filename=filename,
-                    status="failed",
-                    stage="failed",
-                    error=str(exc),
-                )
+            create_ingest_task_file(
+                file_id=file_id,
+                task_id=task_id,
+                document_id="",
+                filename=filename,
+                file_type=extension,
+                stored_path="",
+                status="failed",
+                stage="failed",
+                error=str(exc),
             )
+        else:
+            create_ingest_task_file(
+                file_id=file_id,
+                task_id=task_id,
+                document_id=document_id,
+                filename=filename,
+                file_type=extension,
+                stored_path=relative_path(stored_path),
+                status="queued",
+                stage="uploaded",
+            )
+            queued_count += 1
+        finally:
+            await file.close()
 
-    succeeded = sum(1 for item in items if item.status == "indexed")
+    refresh_ingest_task_counters(task_id)
 
-    return BatchUploadResponse(
-        total=len(items),
-        succeeded=succeeded,
-        failed=len(items) - succeeded,
-        items=items,
-    )
+    if queued_count > 0:
+        background_tasks.add_task(process_ingest_task, task_id)
+
+    return build_ingest_task_response(task_id)
+
+
+@app.get("/api/ingest-tasks/{task_id}", response_model=IngestTaskResponse)
+def get_ingest_task(task_id: str) -> IngestTaskResponse:
+    return build_ingest_task_response(task_id)
 
 
 @app.get("/api/documents", response_model=DocumentListResponse)

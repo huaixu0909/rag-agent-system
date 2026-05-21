@@ -2,14 +2,15 @@
 
 企业知识库 RAG Agent 系统最小原型。
 
-当前版本是 `v1.4`，已经支持 SQLite 文档元数据存储、文档上传、批量上传、上传解析进度反馈、后端分页文档库、文本解析、结构增强 chunking、JSON chunks 留存、Chroma 本地向量库检索、Qwen Embedding、相似度阈值拒答，以及 LangGraph + LangChain + DeepSeek RAG 问答。
+当前版本是 `v1.5`，已经支持异步入库任务队列、SQLite 文档元数据存储、文档上传、批量上传、上传解析进度反馈、后端分页文档库、文本解析、结构增强 chunking、JSON chunks 留存、Chroma 本地向量库检索、Qwen Embedding、相似度阈值拒答，以及 LangGraph + LangChain + DeepSeek RAG 问答。
 
 ## 当前功能
 
 - FastAPI 后端服务
 - SQLite 文档元数据存储：`data/rag_agent.db`
 - 单文件上传接口：`POST /api/documents/upload`
-- 批量上传接口：`POST /api/documents/upload/batch`
+- 异步批量上传接口：`POST /api/documents/upload/batch`
+- 入库任务进度接口：`GET /api/ingest-tasks/{task_id}`
 - 文档分页列表接口：`GET /api/documents?page=1&page_size=10`
 - 文档详情接口：`GET /api/documents/{document_id}`
 - 文档删除接口：`DELETE /api/documents/{document_id}`
@@ -18,6 +19,50 @@
 - 向量库重建接口：`POST /api/vector-store/rebuild`
 - LangGraph RAG 问答接口：`POST /api/chat`
 - Swagger API 文档：`GET /docs`
+
+## v1.5 异步入库任务队列
+
+批量上传已经从“请求内同步解析”改为“任务化后台入库”：
+
+```text
+POST /api/documents/upload/batch
+-> 保存上传文件
+-> 创建 task_id
+-> 立即返回任务状态
+-> 后台执行 parsing / chunking / embedding / indexing
+```
+
+查询任务进度：
+
+```text
+GET /api/ingest-tasks/{task_id}
+```
+
+任务状态：
+
+```text
+queued          已创建，等待后台执行
+running         正在执行
+completed       全部成功
+partial_failed  部分成功、部分失败
+failed          全部失败
+```
+
+单文件阶段：
+
+```text
+uploaded -> parsing -> chunking -> embedding -> indexing -> indexed
+failed
+```
+
+SQLite 新增表：
+
+```text
+ingest_tasks       入库任务主表
+ingest_task_files  单文件任务明细
+```
+
+前端 RAG Demo 会轮询任务接口，并展示每个文件的当前阶段。这样大文件解析、embedding 和写入 Chroma 不再阻塞上传接口响应。
 
 ## v1.4 SQLite 文档元数据
 
@@ -39,6 +84,7 @@ chunks 路径
 字符数
 chunk 数
 创建时间
+入库任务状态
 ```
 
 系统启动或首次访问接口时，会自动创建数据库表。如果本地还存在旧的 `data/documents.json`，系统会自动导入一次，并写入迁移标记，避免后续删除文档后又被旧 JSON 重新导入。
