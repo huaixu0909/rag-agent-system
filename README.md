@@ -2,11 +2,12 @@
 
 企业知识库 RAG Agent 系统最小原型。
 
-当前版本是 `v1.3`，已经支持文档上传、批量上传、上传解析进度反馈、后端分页文档库、文本解析、结构增强 chunking、JSON chunks 留存、Chroma 本地向量库检索、Qwen Embedding、相似度阈值拒答，以及 LangGraph + LangChain + DeepSeek RAG 问答。
+当前版本是 `v1.4`，已经支持 SQLite 文档元数据存储、文档上传、批量上传、上传解析进度反馈、后端分页文档库、文本解析、结构增强 chunking、JSON chunks 留存、Chroma 本地向量库检索、Qwen Embedding、相似度阈值拒答，以及 LangGraph + LangChain + DeepSeek RAG 问答。
 
 ## 当前功能
 
 - FastAPI 后端服务
+- SQLite 文档元数据存储：`data/rag_agent.db`
 - 单文件上传接口：`POST /api/documents/upload`
 - 批量上传接口：`POST /api/documents/upload/batch`
 - 文档分页列表接口：`GET /api/documents?page=1&page_size=10`
@@ -17,6 +18,40 @@
 - 向量库重建接口：`POST /api/vector-store/rebuild`
 - LangGraph RAG 问答接口：`POST /api/chat`
 - Swagger API 文档：`GET /docs`
+
+## v1.4 SQLite 文档元数据
+
+文档元数据已经从 `data/documents.json` 迁移到 SQLite：
+
+```text
+data/rag_agent.db
+```
+
+SQLite 当前负责保存：
+
+```text
+文档 id
+原始文件名
+文件类型
+原始文件路径
+解析文本路径
+chunks 路径
+字符数
+chunk 数
+创建时间
+```
+
+系统启动或首次访问接口时，会自动创建数据库表。如果本地还存在旧的 `data/documents.json`，系统会自动导入一次，并写入迁移标记，避免后续删除文档后又被旧 JSON 重新导入。
+
+当前存储分工：
+
+```text
+SQLite             文档元数据、分页列表、详情索引
+data/uploads       原始上传文件
+data/parsed        解析后的纯文本
+data/chunks        可调试 JSON chunks
+Chroma             向量检索索引
+```
 
 ## v1.3 LangGraph RAG Chat
 
@@ -319,7 +354,8 @@ data/uploads        原始上传文件
 data/parsed         解析后的纯文本
 data/chunks         文本切分后的 chunks、metadata、overlap 和 embedding
 data/chroma         Chroma 本地向量库
-data/documents.json 文档元数据
+data/rag_agent.db   SQLite 文档元数据
+data/documents.json v1.4 之前的旧元数据文件，仅用于一次性迁移
 ```
 
 ## 前端 Demo

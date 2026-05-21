@@ -4,6 +4,7 @@ import math
 import os
 import re
 import shutil
+import sqlite3
 import urllib.error
 import urllib.request
 import uuid
@@ -36,9 +37,10 @@ PARSED_DIR = DATA_DIR / "parsed"
 CHUNKS_DIR = DATA_DIR / "chunks"
 CHROMA_DIR = DATA_DIR / "chroma"
 DOCUMENTS_FILE = DATA_DIR / "documents.json"
+DATABASE_FILE = DATA_DIR / "rag_agent.db"
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf"}
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 EMBEDDING_DIM = 256
 TARGET_CHUNK_SIZE = 1200
 MAX_CHUNK_SIZE = 1800
@@ -253,27 +255,192 @@ def ensure_data_dirs() -> None:
     PARSED_DIR.mkdir(parents=True, exist_ok=True)
     CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+    initialize_database()
+
+
+def open_database() -> sqlite3.Connection:
+    connection = sqlite3.connect(DATABASE_FILE)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def initialize_database() -> None:
+    with open_database() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS documents (
+                id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                file_type TEXT NOT NULL,
+                stored_path TEXT NOT NULL,
+                parsed_path TEXT NOT NULL DEFAULT '',
+                chunks_path TEXT NOT NULL DEFAULT '',
+                char_count INTEGER NOT NULL DEFAULT 0,
+                chunk_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_documents_created_at ON documents(created_at DESC)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        connection.commit()
+
+    migrate_documents_json_to_sqlite()
+
+
+def migrate_documents_json_to_sqlite() -> None:
+    with open_database() as connection:
+        migrated = connection.execute(
+            "SELECT value FROM app_meta WHERE key = ?",
+            ("documents_json_migrated",),
+        ).fetchone()
+        if migrated is not None:
+            return
+
     if not DOCUMENTS_FILE.exists():
-        DOCUMENTS_FILE.write_text("[]", encoding="utf-8")
+        mark_documents_json_migrated()
+        return
+
+    try:
+        raw_documents = json.loads(DOCUMENTS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        mark_documents_json_migrated()
+        return
+
+    if not isinstance(raw_documents, list):
+        mark_documents_json_migrated()
+        return
+
+    documents: list[DocumentRecord] = []
+    for item in raw_documents:
+        try:
+            documents.append(DocumentRecord(**item))
+        except Exception:
+            continue
+
+    if not documents:
+        mark_documents_json_migrated()
+        return
+
+    with open_database() as connection:
+        for document in documents:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO documents (
+                    id, filename, file_type, stored_path, parsed_path,
+                    chunks_path, char_count, chunk_count, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                document_to_database_tuple(document),
+            )
+        connection.execute(
+            "INSERT OR REPLACE INTO app_meta (key, value) VALUES (?, ?)",
+            ("documents_json_migrated", datetime.now(timezone.utc).isoformat()),
+        )
+        connection.commit()
+
+
+def mark_documents_json_migrated() -> None:
+    with open_database() as connection:
+        connection.execute(
+            "INSERT OR REPLACE INTO app_meta (key, value) VALUES (?, ?)",
+            ("documents_json_migrated", datetime.now(timezone.utc).isoformat()),
+        )
+        connection.commit()
+
+
+def document_to_database_tuple(document: DocumentRecord) -> tuple[str, str, str, str, str, str, int, int, str]:
+    return (
+        document.id,
+        document.filename,
+        document.file_type,
+        document.stored_path,
+        document.parsed_path,
+        document.chunks_path,
+        document.char_count,
+        document.chunk_count,
+        document.created_at,
+    )
+
+
+def document_from_row(row: sqlite3.Row) -> DocumentRecord:
+    return DocumentRecord(
+        id=str(row["id"]),
+        filename=str(row["filename"]),
+        file_type=str(row["file_type"]),
+        stored_path=str(row["stored_path"]),
+        parsed_path=str(row["parsed_path"] or ""),
+        chunks_path=str(row["chunks_path"] or ""),
+        char_count=int(row["char_count"] or 0),
+        chunk_count=int(row["chunk_count"] or 0),
+        created_at=str(row["created_at"]),
+    )
 
 
 def load_documents() -> list[DocumentRecord]:
     ensure_data_dirs()
-    try:
-        raw_documents = json.loads(DOCUMENTS_FILE.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        raw_documents = []
 
-    return [DocumentRecord(**item) for item in raw_documents]
+    with open_database() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, filename, file_type, stored_path, parsed_path,
+                   chunks_path, char_count, chunk_count, created_at
+            FROM documents
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+
+    return [document_from_row(row) for row in rows]
+
+
+def insert_document_record(document: DocumentRecord) -> None:
+    ensure_data_dirs()
+    with open_database() as connection:
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO documents (
+                id, filename, file_type, stored_path, parsed_path,
+                chunks_path, char_count, chunk_count, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            document_to_database_tuple(document),
+        )
+        connection.commit()
+
+
+def delete_document_record(document_id: str) -> None:
+    ensure_data_dirs()
+    with open_database() as connection:
+        connection.execute("DELETE FROM documents WHERE id = ?", (document_id,))
+        connection.commit()
 
 
 def save_documents(documents: list[DocumentRecord]) -> None:
     ensure_data_dirs()
-    payload = [document.model_dump() for document in documents]
-    DOCUMENTS_FILE.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    with open_database() as connection:
+        connection.execute("DELETE FROM documents")
+        connection.executemany(
+            """
+            INSERT OR REPLACE INTO documents (
+                id, filename, file_type, stored_path, parsed_path,
+                chunks_path, char_count, chunk_count, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [document_to_database_tuple(document) for document in documents],
+        )
+        connection.commit()
 
 
 def sorted_documents() -> list[DocumentRecord]:
@@ -1278,9 +1445,7 @@ async def ingest_upload_file(file: UploadFile) -> DocumentRecord:
     except Exception:
         pass
 
-    documents = load_documents()
-    documents.append(document)
-    save_documents(documents)
+    insert_document_record(document)
 
     return document
 
@@ -1440,7 +1605,7 @@ def delete_document(document_id: str) -> DeleteDocumentResponse:
         if removed is not None
     ]
 
-    save_documents([item for item in documents if item.id != document_id])
+    delete_document_record(document.id)
 
     return DeleteDocumentResponse(
         deleted=True,
