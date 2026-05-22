@@ -40,7 +40,7 @@ DOCUMENTS_FILE = DATA_DIR / "documents.json"
 DATABASE_FILE = DATA_DIR / "rag_agent.db"
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf"}
 
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.9.0"
 EMBEDDING_DIM = 256
 TARGET_CHUNK_SIZE = 1200
 MAX_CHUNK_SIZE = 1800
@@ -54,6 +54,11 @@ SEARCH_TOP_K_MAX = 20
 SEARCH_SCORE_THRESHOLD_DEFAULT = 0.2
 RERANK_CANDIDATE_MULTIPLIER = 6
 RERANK_CANDIDATE_MAX = 80
+OVERVIEW_PREVIEW_CHARS = 260
+OVERVIEW_MAX_DOCUMENTS_IN_ANSWER = 20
+DOCUMENT_SUMMARY_CHARS = 360
+DOCUMENT_TAG_MAX_COUNT = 12
+DOCUMENT_TAG_MAX_LENGTH = 24
 
 ChunkStrategy = Literal[
     "semantic",
@@ -97,6 +102,9 @@ class DocumentRecord(BaseModel):
     stored_path: str
     parsed_path: str = ""
     chunks_path: str = ""
+    content_hash: str = ""
+    summary: str = ""
+    tags: list[str] = Field(default_factory=list)
     char_count: int
     chunk_count: int = 0
     created_at: str
@@ -127,7 +135,7 @@ class BatchUploadResponse(BaseModel):
 
 
 IngestTaskStatus = Literal["queued", "running", "completed", "failed", "partial_failed"]
-IngestFileStatus = Literal["queued", "running", "indexed", "failed"]
+IngestFileStatus = Literal["queued", "running", "indexed", "failed", "duplicate"]
 IngestFileStage = Literal[
     "uploaded",
     "queued",
@@ -136,6 +144,7 @@ IngestFileStage = Literal[
     "embedding",
     "indexing",
     "indexed",
+    "duplicate",
     "failed",
 ]
 
@@ -147,6 +156,7 @@ class IngestTaskFileResponse(BaseModel):
     stage: IngestFileStage
     document_id: str = ""
     document: DocumentRecord | None = None
+    duplicate_document: DocumentRecord | None = None
     char_count: int = 0
     chunk_count: int = 0
     error: str = ""
@@ -197,6 +207,12 @@ class DeleteDocumentResponse(BaseModel):
     document_id: str
     filename: str
     removed_files: list[str]
+    vector_chunks_deleted: int = 0
+    sqlite_deleted: bool = True
+
+
+class UpdateDocumentTagsRequest(BaseModel):
+    tags: list[str] = Field(default_factory=list, max_length=DOCUMENT_TAG_MAX_COUNT)
 
 
 class SearchRequest(BaseModel):
@@ -255,6 +271,7 @@ class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
     top_k: int = Field(default=SEARCH_TOP_K_DEFAULT, ge=1, le=SEARCH_TOP_K_MAX)
     score_threshold: float = Field(default=SEARCH_SCORE_THRESHOLD_DEFAULT, ge=0.0, le=1.0)
+    session_id: str | None = Field(default=None, max_length=80)
 
 
 class Source(BaseModel):
@@ -268,14 +285,52 @@ class Source(BaseModel):
     section_path: list[str] = Field(default_factory=list)
 
 
+class KnowledgeOverviewDocument(BaseModel):
+    document_id: str
+    filename: str
+    file_type: str
+    char_count: int
+    chunk_count: int
+    created_at: str
+    preview: str = ""
+    summary: str = ""
+    tags: list[str] = Field(default_factory=list)
+
+
+class KnowledgeOverview(BaseModel):
+    document_count: int
+    total_chunks: int
+    total_char_count: int
+    documents: list[KnowledgeOverviewDocument]
+    truncated: bool = False
+
+
+class ChatMessage(BaseModel):
+    id: str
+    session_id: str
+    role: Literal["user", "assistant"]
+    content: str
+    created_at: str
+
+
 class ChatResponse(BaseModel):
+    session_id: str = ""
+    rewritten_question: str = ""
     answer: str
     sources: list[Source]
-    mode: Literal["langgraph_deepseek", "langchain_deepseek", "deepseek", "retrieval_template"]
+    mode: Literal[
+        "langgraph_deepseek",
+        "langchain_deepseek",
+        "deepseek",
+        "retrieval_template",
+        "knowledge_overview",
+    ]
     retrieval_mode: Literal["chroma", "local_hash_embedding"] = "local_hash_embedding"
     score_threshold: float = SEARCH_SCORE_THRESHOLD_DEFAULT
     workflow: Literal["langgraph", "manual"] = "manual"
     graph_path: list[str] = Field(default_factory=list)
+    messages: list[ChatMessage] = Field(default_factory=list)
+    overview: KnowledgeOverview | None = None
 
 
 @dataclass
@@ -309,6 +364,45 @@ def open_database() -> sqlite3.Connection:
     return connection
 
 
+def ensure_table_columns(
+    connection: sqlite3.Connection,
+    table_name: str,
+    columns: dict[str, str],
+) -> None:
+    existing_columns = {
+        str(row["name"])
+        for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+
+    for column_name, column_definition in columns.items():
+        if column_name not in existing_columns:
+            connection.execute(
+                f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}"
+            )
+
+
+def ensure_document_columns(connection: sqlite3.Connection) -> None:
+    ensure_table_columns(
+        connection,
+        "documents",
+        {
+            "content_hash": "TEXT NOT NULL DEFAULT ''",
+            "summary": "TEXT NOT NULL DEFAULT ''",
+            "tags": "TEXT NOT NULL DEFAULT '[]'",
+        },
+    )
+
+
+def ensure_ingest_task_file_columns(connection: sqlite3.Connection) -> None:
+    ensure_table_columns(
+        connection,
+        "ingest_task_files",
+        {
+            "duplicate_document_id": "TEXT NOT NULL DEFAULT ''",
+        },
+    )
+
+
 def initialize_database() -> None:
     with open_database() as connection:
         connection.execute(
@@ -320,14 +414,24 @@ def initialize_database() -> None:
                 stored_path TEXT NOT NULL,
                 parsed_path TEXT NOT NULL DEFAULT '',
                 chunks_path TEXT NOT NULL DEFAULT '',
+                content_hash TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                tags TEXT NOT NULL DEFAULT '[]',
                 char_count INTEGER NOT NULL DEFAULT 0,
                 chunk_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             )
             """
         )
+        ensure_document_columns(connection)
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_documents_created_at ON documents(created_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_documents_filename ON documents(filename)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_documents_content_hash ON documents(content_hash)"
         )
         connection.execute(
             """
@@ -360,6 +464,7 @@ def initialize_database() -> None:
                 filename TEXT NOT NULL,
                 file_type TEXT NOT NULL DEFAULT '',
                 stored_path TEXT NOT NULL DEFAULT '',
+                duplicate_document_id TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL,
                 stage TEXT NOT NULL,
                 char_count INTEGER NOT NULL DEFAULT 0,
@@ -371,8 +476,34 @@ def initialize_database() -> None:
             )
             """
         )
+        ensure_ingest_task_file_columns(connection)
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_ingest_task_files_task_id ON ingest_task_files(task_id)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                session_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES chat_sessions(session_id)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id ON chat_messages(session_id, created_at ASC)"
         )
         connection.commit()
 
@@ -419,9 +550,10 @@ def migrate_documents_json_to_sqlite() -> None:
                 """
                 INSERT OR IGNORE INTO documents (
                     id, filename, file_type, stored_path, parsed_path,
-                    chunks_path, char_count, chunk_count, created_at
+                    chunks_path, content_hash, summary, tags,
+                    char_count, chunk_count, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 document_to_database_tuple(document),
             )
@@ -441,7 +573,25 @@ def mark_documents_json_migrated() -> None:
         connection.commit()
 
 
-def document_to_database_tuple(document: DocumentRecord) -> tuple[str, str, str, str, str, str, int, int, str]:
+def normalize_document_tags(tags: list[str]) -> list[str]:
+    normalized_tags: list[str] = []
+    seen: set[str] = set()
+
+    for raw_tag in tags:
+        tag = re.sub(r"\s+", " ", str(raw_tag)).strip()
+        if not tag or len(tag) > DOCUMENT_TAG_MAX_LENGTH or tag in seen:
+            continue
+        normalized_tags.append(tag)
+        seen.add(tag)
+        if len(normalized_tags) >= DOCUMENT_TAG_MAX_COUNT:
+            break
+
+    return normalized_tags
+
+
+def document_to_database_tuple(
+    document: DocumentRecord,
+) -> tuple[str, str, str, str, str, str, str, str, str, int, int, str]:
     return (
         document.id,
         document.filename,
@@ -449,6 +599,9 @@ def document_to_database_tuple(document: DocumentRecord) -> tuple[str, str, str,
         document.stored_path,
         document.parsed_path,
         document.chunks_path,
+        document.content_hash,
+        document.summary,
+        json.dumps(normalize_document_tags(document.tags), ensure_ascii=False),
         document.char_count,
         document.chunk_count,
         document.created_at,
@@ -456,6 +609,12 @@ def document_to_database_tuple(document: DocumentRecord) -> tuple[str, str, str,
 
 
 def document_from_row(row: sqlite3.Row) -> DocumentRecord:
+    raw_tags = str(row["tags"] or "[]") if "tags" in row.keys() else "[]"
+    try:
+        tags = json.loads(raw_tags)
+    except json.JSONDecodeError:
+        tags = []
+
     return DocumentRecord(
         id=str(row["id"]),
         filename=str(row["filename"]),
@@ -463,6 +622,9 @@ def document_from_row(row: sqlite3.Row) -> DocumentRecord:
         stored_path=str(row["stored_path"]),
         parsed_path=str(row["parsed_path"] or ""),
         chunks_path=str(row["chunks_path"] or ""),
+        content_hash=str(row["content_hash"] or "") if "content_hash" in row.keys() else "",
+        summary=str(row["summary"] or "") if "summary" in row.keys() else "",
+        tags=normalize_document_tags(tags if isinstance(tags, list) else []),
         char_count=int(row["char_count"] or 0),
         chunk_count=int(row["chunk_count"] or 0),
         created_at=str(row["created_at"]),
@@ -476,7 +638,8 @@ def load_documents() -> list[DocumentRecord]:
         rows = connection.execute(
             """
             SELECT id, filename, file_type, stored_path, parsed_path,
-                   chunks_path, char_count, chunk_count, created_at
+                   chunks_path, content_hash, summary, tags,
+                   char_count, chunk_count, created_at
             FROM documents
             ORDER BY created_at DESC
             """
@@ -492,9 +655,10 @@ def insert_document_record(document: DocumentRecord) -> None:
             """
             INSERT OR REPLACE INTO documents (
                 id, filename, file_type, stored_path, parsed_path,
-                chunks_path, char_count, chunk_count, created_at
+                chunks_path, content_hash, summary, tags,
+                char_count, chunk_count, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             document_to_database_tuple(document),
         )
@@ -516,9 +680,10 @@ def save_documents(documents: list[DocumentRecord]) -> None:
             """
             INSERT OR REPLACE INTO documents (
                 id, filename, file_type, stored_path, parsed_path,
-                chunks_path, char_count, chunk_count, created_at
+                chunks_path, content_hash, summary, tags,
+                char_count, chunk_count, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [document_to_database_tuple(document) for document in documents],
         )
@@ -575,6 +740,7 @@ def create_ingest_task_file(
     status: IngestFileStatus,
     stage: IngestFileStage,
     error: str = "",
+    duplicate_document_id: str = "",
 ) -> None:
     ensure_data_dirs()
     now = datetime.now(timezone.utc).isoformat()
@@ -583,9 +749,10 @@ def create_ingest_task_file(
             """
             INSERT INTO ingest_task_files (
                 file_id, task_id, document_id, filename, file_type,
-                stored_path, status, stage, error, created_at, updated_at
+                stored_path, duplicate_document_id, status, stage,
+                error, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 file_id,
@@ -594,6 +761,7 @@ def create_ingest_task_file(
                 filename,
                 file_type,
                 stored_path,
+                duplicate_document_id,
                 status,
                 stage,
                 error,
@@ -627,6 +795,7 @@ def update_ingest_task_file(
     char_count: int | None = None,
     chunk_count: int | None = None,
     error: str | None = None,
+    duplicate_document_id: str | None = None,
 ) -> None:
     updates: list[str] = ["updated_at = ?"]
     values: list[object] = [datetime.now(timezone.utc).isoformat()]
@@ -646,6 +815,9 @@ def update_ingest_task_file(
     if error is not None:
         updates.append("error = ?")
         values.append(error)
+    if duplicate_document_id is not None:
+        updates.append("duplicate_document_id = ?")
+        values.append(duplicate_document_id)
 
     values.append(file_id)
 
@@ -670,7 +842,7 @@ def refresh_ingest_task_counters(task_id: str) -> None:
 
         total = len(rows)
         succeeded = sum(1 for row in rows if row["status"] == "indexed")
-        failed = sum(1 for row in rows if row["status"] == "failed")
+        failed = sum(1 for row in rows if row["status"] in {"failed", "duplicate"})
         running = any(row["status"] == "running" for row in rows)
         queued = any(row["status"] == "queued" for row in rows)
 
@@ -709,7 +881,8 @@ def get_document_or_none(document_id: str) -> DocumentRecord | None:
         row = connection.execute(
             """
             SELECT id, filename, file_type, stored_path, parsed_path,
-                   chunks_path, char_count, chunk_count, created_at
+                   chunks_path, content_hash, summary, tags,
+                   char_count, chunk_count, created_at
             FROM documents
             WHERE id = ?
             """,
@@ -740,7 +913,7 @@ def build_ingest_task_response(task_id: str) -> IngestTaskResponse:
         rows = connection.execute(
             """
             SELECT file_id, filename, status, stage, document_id,
-                   char_count, chunk_count, error
+                   duplicate_document_id, char_count, chunk_count, error
             FROM ingest_task_files
             WHERE task_id = ?
             ORDER BY created_at ASC
@@ -756,6 +929,7 @@ def build_ingest_task_response(task_id: str) -> IngestTaskResponse:
             stage=row["stage"],
             document_id=str(row["document_id"] or ""),
             document=get_document_or_none(str(row["document_id"] or "")),
+            duplicate_document=get_document_or_none(str(row["duplicate_document_id"] or "")),
             char_count=int(row["char_count"] or 0),
             chunk_count=int(row["chunk_count"] or 0),
             error=str(row["error"] or ""),
@@ -774,6 +948,276 @@ def build_ingest_task_response(task_id: str) -> IngestTaskResponse:
         completed_at=str(task["completed_at"] or ""),
         items=items,
     )
+
+
+def normalize_session_id(session_id: str | None) -> str:
+    if session_id and re.match(r"^[A-Za-z0-9_-]{6,80}$", session_id):
+        return session_id
+    return f"session_{uuid.uuid4().hex[:12]}"
+
+
+def ensure_chat_session(session_id: str | None, first_question: str) -> str:
+    ensure_data_dirs()
+    normalized_session_id = normalize_session_id(session_id)
+    now = datetime.now(timezone.utc).isoformat()
+    title = first_question.strip()[:80] or "New conversation"
+
+    with open_database() as connection:
+        existing = connection.execute(
+            "SELECT session_id FROM chat_sessions WHERE session_id = ?",
+            (normalized_session_id,),
+        ).fetchone()
+        if existing is None:
+            connection.execute(
+                """
+                INSERT INTO chat_sessions (session_id, title, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (normalized_session_id, title, now, now),
+            )
+        else:
+            connection.execute(
+                "UPDATE chat_sessions SET updated_at = ? WHERE session_id = ?",
+                (now, normalized_session_id),
+            )
+        connection.commit()
+
+    return normalized_session_id
+
+
+def chat_message_from_row(row: sqlite3.Row) -> ChatMessage:
+    return ChatMessage(
+        id=str(row["id"]),
+        session_id=str(row["session_id"]),
+        role=row["role"],
+        content=str(row["content"]),
+        created_at=str(row["created_at"]),
+    )
+
+
+def load_chat_messages(session_id: str, limit: int = 12) -> list[ChatMessage]:
+    ensure_data_dirs()
+    with open_database() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, session_id, role, content, created_at
+            FROM chat_messages
+            WHERE session_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (session_id, limit),
+        ).fetchall()
+
+    return [chat_message_from_row(row) for row in reversed(rows)]
+
+
+def add_chat_message(session_id: str, role: Literal["user", "assistant"], content: str) -> ChatMessage:
+    ensure_data_dirs()
+    now = datetime.now(timezone.utc).isoformat()
+    message = ChatMessage(
+        id=f"msg_{uuid.uuid4().hex[:12]}",
+        session_id=session_id,
+        role=role,
+        content=content,
+        created_at=now,
+    )
+
+    with open_database() as connection:
+        connection.execute(
+            """
+            INSERT INTO chat_messages (id, session_id, role, content, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (message.id, message.session_id, message.role, message.content, message.created_at),
+        )
+        connection.execute(
+            "UPDATE chat_sessions SET updated_at = ? WHERE session_id = ?",
+            (now, session_id),
+        )
+        connection.commit()
+
+    return message
+
+
+def build_contextual_question(question: str, history: list[ChatMessage]) -> str:
+    recent_history = history[-6:]
+    if not recent_history:
+        return question
+
+    history_lines = [
+        f"{'用户' if message.role == 'user' else '助手'}：{message.content[:260]}"
+        for message in recent_history
+    ]
+    return (
+        "以下是当前会话的最近上下文，请将最后的问题理解为可独立检索的问题。\n"
+        + "\n".join(history_lines)
+        + f"\n当前问题：{question}"
+    )
+
+
+def compact_preview_text(text: str, max_chars: int = OVERVIEW_PREVIEW_CHARS) -> str:
+    compacted = re.sub(r"\s+", " ", text).strip()
+    if len(compacted) <= max_chars:
+        return compacted
+    return compacted[:max_chars].rstrip() + "..."
+
+
+def is_knowledge_overview_question(question: str) -> bool:
+    normalized = re.sub(r"\s+", "", question).lower()
+    if not normalized:
+        return False
+
+    scope_terms = [
+        "知识库",
+        "文档库",
+        "资料库",
+        "已上传",
+        "上传了",
+        "上传的",
+        "当前资料",
+        "当前文档",
+        "库里",
+    ]
+    overview_terms = [
+        "有哪些",
+        "有什么",
+        "包含什么",
+        "包含哪些",
+        "收录",
+        "目录",
+        "清单",
+        "列表",
+        "概览",
+        "范围",
+        "多少",
+        "几份",
+        "哪些文件",
+        "哪些文档",
+        "哪些内容",
+    ]
+    direct_questions = [
+        "当前知识库有哪些内容",
+        "知识库有哪些内容",
+        "当前知识库有什么",
+        "文档库有哪些内容",
+        "我上传了哪些文件",
+        "我上传了哪些文档",
+    ]
+
+    if any(item in normalized for item in direct_questions):
+        return True
+
+    return any(term in normalized for term in scope_terms) and any(
+        term in normalized for term in overview_terms
+    )
+
+
+def build_document_overview_item(document: DocumentRecord) -> KnowledgeOverviewDocument:
+    preview = compact_preview_text(document.summary, OVERVIEW_PREVIEW_CHARS)
+    if not preview:
+        try:
+            chunks = load_chunks(document)
+        except Exception:
+            chunks = []
+    else:
+        chunks = []
+
+    if not preview and chunks:
+        first_chunk = next((chunk for chunk in chunks if chunk.content.strip()), chunks[0])
+        heading = " / ".join(first_chunk.section_path) or first_chunk.title
+        content_preview = compact_preview_text(first_chunk.content)
+        preview = f"{heading}：{content_preview}" if heading else content_preview
+    elif not preview:
+        parsed_text = load_text_preview(document)
+        preview = compact_preview_text(parsed_text)
+
+    return KnowledgeOverviewDocument(
+        document_id=document.id,
+        filename=document.filename,
+        file_type=document.file_type,
+        char_count=document.char_count,
+        chunk_count=document.chunk_count,
+        created_at=document.created_at,
+        preview=preview,
+        summary=document.summary,
+        tags=document.tags,
+    )
+
+
+def build_knowledge_overview() -> KnowledgeOverview:
+    documents = sorted_documents()
+    overview_documents = [
+        build_document_overview_item(document)
+        for document in documents[:OVERVIEW_MAX_DOCUMENTS_IN_ANSWER]
+    ]
+
+    return KnowledgeOverview(
+        document_count=len(documents),
+        total_chunks=sum(document.chunk_count for document in documents),
+        total_char_count=sum(document.char_count for document in documents),
+        documents=overview_documents,
+        truncated=len(documents) > OVERVIEW_MAX_DOCUMENTS_IN_ANSWER,
+    )
+
+
+def build_knowledge_overview_answer(overview: KnowledgeOverview) -> str:
+    if overview.document_count == 0:
+        return (
+            "当前知识库还没有文档。请先上传 txt、md 或 pdf 文件，系统完成解析、"
+            "chunking、embedding 和入库后，我就可以回答知识库范围内的问题。"
+        )
+
+    lines = [
+        (
+            f"当前知识库共有 {overview.document_count} 份文档，"
+            f"约 {overview.total_char_count} 个字符，"
+            f"已切分为 {overview.total_chunks} 个 chunks。"
+        ),
+        "",
+        "文档概览：",
+    ]
+
+    for index, document in enumerate(overview.documents, start=1):
+        lines.append(
+            (
+                f"{index}. 《{document.filename}》"
+                f"（{document.file_type}，{document.char_count} 字符，"
+                f"{document.chunk_count} 个 chunks）"
+            )
+        )
+        if document.preview:
+            lines.append(f"   内容线索：{document.preview}")
+        if document.tags:
+            lines.append(f"   标签：{'、'.join(document.tags)}")
+
+    if overview.truncated:
+        hidden_count = overview.document_count - len(overview.documents)
+        lines.append("")
+        lines.append(f"还有 {hidden_count} 份文档未在本次回答中展开，可在文档库分页中继续查看。")
+
+    lines.extend(
+        [
+            "",
+            "你可以继续问：",
+            "- 基于某一份文档总结核心观点",
+            "- 对比几份文档的共同主题",
+            "- 只围绕某个文件或章节提问",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_knowledge_overview_sources(overview: KnowledgeOverview) -> list[Source]:
+    return [
+        Source(
+            title=document.filename,
+            content=document.preview or "该文档暂无可展示的内容线索。",
+            document_id=document.document_id,
+            score=None,
+        )
+        for document in overview.documents
+    ]
 
 
 def repair_mojibake_filename(filename: str) -> str:
@@ -795,6 +1239,108 @@ def safe_filename(filename: str) -> str:
 
 def relative_path(path: Path) -> str:
     return str(path.relative_to(BASE_DIR)).replace("\\", "/")
+
+
+def calculate_file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def find_duplicate_document(
+    filename: str,
+    content_hash: str = "",
+) -> tuple[DocumentRecord | None, str]:
+    ensure_data_dirs()
+    with open_database() as connection:
+        row = None
+        reason = ""
+
+        if content_hash:
+            row = connection.execute(
+                """
+                SELECT id, filename, file_type, stored_path, parsed_path,
+                       chunks_path, content_hash, summary, tags,
+                       char_count, chunk_count, created_at
+                FROM documents
+                WHERE content_hash = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (content_hash,),
+            ).fetchone()
+            if row is not None:
+                reason = "content_hash"
+
+        if row is None:
+            row = connection.execute(
+                """
+                SELECT id, filename, file_type, stored_path, parsed_path,
+                       chunks_path, content_hash, summary, tags,
+                       char_count, chunk_count, created_at
+                FROM documents
+                WHERE filename = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (filename,),
+            ).fetchone()
+            if row is not None:
+                reason = "filename"
+
+    return (document_from_row(row), reason) if row is not None else (None, "")
+
+
+def duplicate_upload_message(filename: str, duplicate: DocumentRecord, reason: str) -> str:
+    if reason == "content_hash":
+        return f"重复上传：文件内容与已入库文档《{duplicate.filename}》完全一致。"
+    return f"重复上传：已存在同名文档《{filename}》。"
+
+
+def generate_document_summary(
+    filename: str,
+    parsed_text: str,
+    chunks: list[DocumentChunk],
+) -> str:
+    section_titles: list[str] = []
+    seen_titles: set[str] = set()
+
+    for chunk in chunks:
+        candidates = [item for item in chunk.section_path if item.strip()]
+        if chunk.title:
+            candidates.append(chunk.title)
+
+        for candidate in candidates:
+            title = compact_preview_text(candidate, 42)
+            if title and title not in seen_titles:
+                section_titles.append(title)
+                seen_titles.add(title)
+                break
+
+        if len(section_titles) >= 4:
+            break
+
+    preview = compact_preview_text(parsed_text, DOCUMENT_SUMMARY_CHARS)
+    if section_titles and preview:
+        return f"主题线索：{'、'.join(section_titles)}。内容摘要：{preview}"
+    if preview:
+        return f"内容摘要：{preview}"
+    return f"《{filename}》已入库，但解析文本较短，暂时无法生成更详细摘要。"
+
+
+def update_document_tags(document_id: str, tags: list[str]) -> DocumentRecord:
+    normalized_tags = normalize_document_tags(tags)
+    ensure_data_dirs()
+    with open_database() as connection:
+        connection.execute(
+            "UPDATE documents SET tags = ? WHERE id = ?",
+            (json.dumps(normalized_tags, ensure_ascii=False), document_id),
+        )
+        connection.commit()
+
+    return find_document(document_id)
 
 
 def load_env_file() -> None:
@@ -1833,6 +2379,18 @@ async def ingest_upload_file(file: UploadFile) -> DocumentRecord:
             detail="Only .txt, .md, and .pdf files are supported.",
         )
 
+    duplicate_by_filename, duplicate_reason = find_duplicate_document(original_filename)
+    if duplicate_by_filename:
+        await file.close()
+        raise HTTPException(
+            status_code=409,
+            detail=duplicate_upload_message(
+                original_filename,
+                duplicate_by_filename,
+                duplicate_reason,
+            ),
+        )
+
     document_id = f"doc_{uuid.uuid4().hex[:12]}"
     stored_path = UPLOAD_DIR / f"{document_id}{extension}"
 
@@ -1841,6 +2399,15 @@ async def ingest_upload_file(file: UploadFile) -> DocumentRecord:
             shutil.copyfileobj(file.file, target)
     finally:
         await file.close()
+
+    content_hash = calculate_file_hash(stored_path)
+    duplicate_by_hash, duplicate_reason = find_duplicate_document(original_filename, content_hash)
+    if duplicate_by_hash:
+        stored_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=409,
+            detail=duplicate_upload_message(original_filename, duplicate_by_hash, duplicate_reason),
+        )
 
     try:
         parsed_text = parse_document(stored_path, extension)
@@ -1858,6 +2425,9 @@ async def ingest_upload_file(file: UploadFile) -> DocumentRecord:
         stored_path=relative_path(stored_path),
         parsed_path=relative_path(parsed_path),
         chunks_path=relative_path(chunks_path),
+        content_hash=content_hash,
+        summary=generate_document_summary(original_filename, parsed_text, chunks),
+        tags=[],
         char_count=len(parsed_text),
         chunk_count=len(chunks),
         created_at=datetime.now(timezone.utc).isoformat(),
@@ -1896,6 +2466,20 @@ def process_ingest_task(task_id: str) -> None:
 
         try:
             update_ingest_task_file(file_id, status="running", stage="parsing")
+            content_hash = calculate_file_hash(stored_path)
+            duplicate_document, duplicate_reason = find_duplicate_document(filename, content_hash)
+            if duplicate_document:
+                stored_path.unlink(missing_ok=True)
+                update_ingest_task_file(
+                    file_id,
+                    status="duplicate",
+                    stage="duplicate",
+                    error=duplicate_upload_message(filename, duplicate_document, duplicate_reason),
+                    duplicate_document_id=duplicate_document.id,
+                )
+                refresh_ingest_task_counters(task_id)
+                continue
+
             parsed_text = parse_document(stored_path, extension)
 
             update_ingest_task_file(file_id, stage="chunking")
@@ -1903,6 +2487,7 @@ def process_ingest_task(task_id: str) -> None:
 
             parsed_path = save_parsed_text(document_id, parsed_text)
             chunks_path = save_chunks(document_id, chunks)
+            summary = generate_document_summary(filename, parsed_text, chunks)
 
             document = DocumentRecord(
                 id=document_id,
@@ -1911,6 +2496,9 @@ def process_ingest_task(task_id: str) -> None:
                 stored_path=relative_path(stored_path),
                 parsed_path=relative_path(parsed_path),
                 chunks_path=relative_path(chunks_path),
+                content_hash=content_hash,
+                summary=summary,
+                tags=[],
                 char_count=len(parsed_text),
                 chunk_count=len(chunks),
                 created_at=datetime.now(timezone.utc).isoformat(),
@@ -1990,6 +2578,8 @@ async def upload_documents_batch(
     task_id = f"task_{uuid.uuid4().hex[:12]}"
     create_ingest_task(task_id, len(files))
     queued_count = 0
+    queued_filenames: set[str] = set()
+    queued_hashes: set[str] = set()
 
     for file in files:
         filename = safe_filename(repair_mojibake_filename(file.filename or ""))
@@ -2012,6 +2602,28 @@ async def upload_documents_batch(
             )
             continue
 
+        duplicate_by_filename, duplicate_reason = find_duplicate_document(filename)
+        if duplicate_by_filename or filename in queued_filenames:
+            await file.close()
+            duplicate_message = (
+                duplicate_upload_message(filename, duplicate_by_filename, duplicate_reason)
+                if duplicate_by_filename
+                else f"重复上传：本次批量上传中已经包含同名文件《{filename}》。"
+            )
+            create_ingest_task_file(
+                file_id=file_id,
+                task_id=task_id,
+                document_id="",
+                filename=filename,
+                file_type=extension,
+                stored_path="",
+                status="duplicate",
+                stage="duplicate",
+                error=duplicate_message,
+                duplicate_document_id=duplicate_by_filename.id if duplicate_by_filename else "",
+            )
+            continue
+
         stored_path = UPLOAD_DIR / f"{document_id}{extension}"
 
         try:
@@ -2030,6 +2642,29 @@ async def upload_documents_batch(
                 error=str(exc),
             )
         else:
+            content_hash = calculate_file_hash(stored_path)
+            duplicate_by_hash, duplicate_reason = find_duplicate_document(filename, content_hash)
+            if duplicate_by_hash or content_hash in queued_hashes:
+                stored_path.unlink(missing_ok=True)
+                duplicate_message = (
+                    duplicate_upload_message(filename, duplicate_by_hash, duplicate_reason)
+                    if duplicate_by_hash
+                    else f"重复上传：本次批量上传中已经包含内容相同的文件《{filename}》。"
+                )
+                create_ingest_task_file(
+                    file_id=file_id,
+                    task_id=task_id,
+                    document_id="",
+                    filename=filename,
+                    file_type=extension,
+                    stored_path="",
+                    status="duplicate",
+                    stage="duplicate",
+                    error=duplicate_message,
+                    duplicate_document_id=duplicate_by_hash.id if duplicate_by_hash else "",
+                )
+                continue
+
             create_ingest_task_file(
                 file_id=file_id,
                 task_id=task_id,
@@ -2040,6 +2675,8 @@ async def upload_documents_batch(
                 status="queued",
                 stage="uploaded",
             )
+            queued_filenames.add(filename)
+            queued_hashes.add(content_hash)
             queued_count += 1
         finally:
             await file.close()
@@ -2063,6 +2700,15 @@ def list_documents(
     page_size: int = Query(default=10, ge=1, le=100),
 ) -> DocumentListResponse:
     return build_document_list_response(page, page_size)
+
+
+@app.patch("/api/documents/{document_id}/tags", response_model=DocumentRecord)
+def patch_document_tags(
+    document_id: str,
+    request: UpdateDocumentTagsRequest,
+) -> DocumentRecord:
+    find_document(document_id)
+    return update_document_tags(document_id, request.tags)
 
 
 @app.get("/api/vector-store/status", response_model=VectorStoreStatusResponse)
@@ -2122,8 +2768,9 @@ def delete_document(document_id: str) -> DeleteDocumentResponse:
     if document is None:
         raise HTTPException(status_code=404, detail="Document not found")
 
+    vector_chunks_deleted = 0
     try:
-        delete_document_chunks(document.id)
+        vector_chunks_deleted = delete_document_chunks(document.id)
     except Exception:
         pass
 
@@ -2144,6 +2791,8 @@ def delete_document(document_id: str) -> DeleteDocumentResponse:
         document_id=document.id,
         filename=document.filename,
         removed_files=removed_files,
+        vector_chunks_deleted=vector_chunks_deleted,
+        sqlite_deleted=True,
     )
 
 
@@ -2258,8 +2907,31 @@ def chat(request: ChatRequest) -> ChatResponse:
 
 @app.post("/api/chat", response_model=ChatResponse)
 def chat_with_strict_rag(request: ChatRequest) -> ChatResponse:
+    session_id = ensure_chat_session(request.session_id, request.question)
+    history = load_chat_messages(session_id)
+    rewritten_question = build_contextual_question(request.question, history)
+    add_chat_message(session_id, "user", request.question)
+
+    if is_knowledge_overview_question(request.question):
+        overview = build_knowledge_overview()
+        response = ChatResponse(
+            session_id=session_id,
+            rewritten_question=request.question,
+            answer=build_knowledge_overview_answer(overview),
+            sources=build_knowledge_overview_sources(overview),
+            mode="knowledge_overview",
+            retrieval_mode="local_hash_embedding",
+            score_threshold=request.score_threshold,
+            workflow="manual",
+            graph_path=["knowledge_overview"],
+            overview=overview,
+        )
+        add_chat_message(session_id, "assistant", response.answer)
+        response.messages = load_chat_messages(session_id)
+        return response
+
     graph_result = run_langgraph_rag_chat(
-        question=request.question,
+        question=rewritten_question,
         top_k=request.top_k,
         score_threshold=request.score_threshold,
         search_fn=lambda question, top_k, score_threshold: search_chunks(
@@ -2276,7 +2948,9 @@ def chat_with_strict_rag(request: ChatRequest) -> ChatResponse:
     )
 
     if graph_result is not None:
-        return ChatResponse(
+        response = ChatResponse(
+            session_id=session_id,
+            rewritten_question=rewritten_question,
             answer=graph_result["answer"],
             sources=graph_result.get("sources", []),
             mode=graph_result["mode"],
@@ -2285,17 +2959,22 @@ def chat_with_strict_rag(request: ChatRequest) -> ChatResponse:
             workflow="langgraph",
             graph_path=graph_result.get("graph_path", []),
         )
+        add_chat_message(session_id, "assistant", response.answer)
+        response.messages = load_chat_messages(session_id)
+        return response
 
     search_response = search_chunks(
         SearchRequest(
-            question=request.question,
+            question=rewritten_question,
             top_k=request.top_k,
             score_threshold=request.score_threshold,
         )
     )
 
     if not search_response.results:
-        return ChatResponse(
+        response = ChatResponse(
+            session_id=session_id,
+            rewritten_question=rewritten_question,
             answer=NO_ENOUGH_CONTEXT_ANSWER,
             sources=[],
             mode="retrieval_template",
@@ -2303,15 +2982,20 @@ def chat_with_strict_rag(request: ChatRequest) -> ChatResponse:
             score_threshold=request.score_threshold,
             workflow="manual",
         )
+        add_chat_message(session_id, "assistant", response.answer)
+        response.messages = load_chat_messages(session_id)
+        return response
 
     sources = build_sources(search_response.results)
     langchain_answer = generate_rag_answer_with_langchain(
-        question=request.question,
+        question=rewritten_question,
         chunks=[item.model_dump() for item in search_response.results],
     )
 
     if langchain_answer:
-        return ChatResponse(
+        response = ChatResponse(
+            session_id=session_id,
+            rewritten_question=rewritten_question,
             answer=langchain_answer,
             sources=sources,
             mode="langchain_deepseek",
@@ -2319,11 +3003,16 @@ def chat_with_strict_rag(request: ChatRequest) -> ChatResponse:
             score_threshold=request.score_threshold,
             workflow="manual",
         )
+        add_chat_message(session_id, "assistant", response.answer)
+        response.messages = load_chat_messages(session_id)
+        return response
 
-    answer = call_deepseek_chat(request.question, search_response.results)
+    answer = call_deepseek_chat(rewritten_question, search_response.results)
 
     if answer:
-        return ChatResponse(
+        response = ChatResponse(
+            session_id=session_id,
+            rewritten_question=rewritten_question,
             answer=answer,
             sources=sources,
             mode="deepseek",
@@ -2331,12 +3020,25 @@ def chat_with_strict_rag(request: ChatRequest) -> ChatResponse:
             score_threshold=request.score_threshold,
             workflow="manual",
         )
+        add_chat_message(session_id, "assistant", response.answer)
+        response.messages = load_chat_messages(session_id)
+        return response
 
-    return ChatResponse(
-        answer=build_retrieval_template_answer(request.question, search_response.results),
+    response = ChatResponse(
+        session_id=session_id,
+        rewritten_question=rewritten_question,
+        answer=build_retrieval_template_answer(rewritten_question, search_response.results),
         sources=sources,
         mode="retrieval_template",
         retrieval_mode=search_response.mode,
         score_threshold=request.score_threshold,
         workflow="manual",
     )
+    add_chat_message(session_id, "assistant", response.answer)
+    response.messages = load_chat_messages(session_id)
+    return response
+
+
+@app.get("/api/chat/sessions/{session_id}/messages", response_model=list[ChatMessage])
+def get_chat_session_messages(session_id: str) -> list[ChatMessage]:
+    return load_chat_messages(normalize_session_id(session_id), limit=50)

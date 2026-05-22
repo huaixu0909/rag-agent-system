@@ -2,7 +2,7 @@
 
 企业知识库 RAG Agent 系统最小原型。
 
-当前版本是 `v1.6`，已经支持混合检索 rerank、异步入库任务队列、SQLite 文档元数据存储、文档上传、批量上传、上传解析进度反馈、后端分页文档库、文本解析、结构增强 chunking、JSON chunks 留存、Chroma 本地向量库检索、Qwen Embedding、相似度阈值拒答，以及 LangGraph + LangChain + DeepSeek RAG 问答。
+当前版本是 `v1.9`，已经支持文档去重、文档摘要、手动标签、知识库概览问答、多轮对话、混合检索 rerank、异步入库任务队列、SQLite 文档元数据存储、文档上传、批量上传、上传解析进度反馈、后端分页文档库、文本解析、结构增强 chunking、JSON chunks 留存、Chroma 本地向量库检索、Qwen Embedding、相似度阈值拒答，以及 LangGraph + LangChain + DeepSeek RAG 问答。
 
 ## 当前功能
 
@@ -13,12 +13,125 @@
 - 入库任务进度接口：`GET /api/ingest-tasks/{task_id}`
 - 文档分页列表接口：`GET /api/documents?page=1&page_size=10`
 - 文档详情接口：`GET /api/documents/{document_id}`
+- 文档标签接口：`PATCH /api/documents/{document_id}/tags`
 - 文档删除接口：`DELETE /api/documents/{document_id}`
 - 混合检索接口：`POST /api/search`
+- 多轮对话接口：`POST /api/chat`
+- 知识库概览问答：通过 `POST /api/chat` 自动识别“当前知识库有哪些内容”等问题
+- 会话消息接口：`GET /api/chat/sessions/{session_id}/messages`
 - 向量库状态接口：`GET /api/vector-store/status`
 - 向量库重建接口：`POST /api/vector-store/rebuild`
-- LangGraph RAG 问答接口：`POST /api/chat`
 - Swagger API 文档：`GET /docs`
+
+## v1.9 知识库管理增强
+
+文档入库现在会写入以下元数据：
+
+```text
+content_hash   文件 SHA-256，用于内容重复检测
+summary        入库时自动生成的文档摘要
+tags           手动维护的文档标签 JSON
+```
+
+重复上传规则：
+
+```text
+同名文件       标记为 duplicate
+内容 hash 相同 标记为 duplicate
+```
+
+批量上传接口会在任务文件项中返回 `duplicate` 状态，并通过 `error` 字段说明重复原因。重复文件不会继续解析、切分、embedding 或写入 Chroma。
+
+手动更新标签：
+
+```http
+PATCH /api/documents/{document_id}/tags
+Content-Type: application/json
+
+{
+  "tags": ["简历", "项目文档", "面试资料"]
+}
+```
+
+删除文档时会同步清理：
+
+```text
+SQLite documents 记录
+Chroma 向量索引
+data/uploads 原始文件
+data/parsed 解析文本
+data/chunks JSON chunks
+```
+
+知识库概览问答会优先使用每份文档的 `summary`，因此“当前知识库有哪些内容”会比直接读取首个 chunk 更稳定。
+
+## v1.8 知识库概览问答
+
+`/api/chat` 现在会先识别知识库概览类问题，例如：
+
+```text
+当前知识库有哪些内容？
+我上传了哪些文档？
+文档库里有什么资料？
+当前资料库收录了哪些文件？
+```
+
+命中这类意图后，系统不会走普通 chunk 相似度检索，而是直接读取 SQLite 中的文档元数据，并结合每个文档的少量 chunk / 解析文本生成稳定的知识库概览。
+
+返回结果会包含：
+
+```json
+{
+  "mode": "knowledge_overview",
+  "graph_path": ["knowledge_overview"],
+  "overview": {
+    "document_count": 3,
+    "total_chunks": 42,
+    "total_char_count": 18000,
+    "documents": []
+  }
+}
+```
+
+这样可以避免“当前知识库有哪些内容”被当成普通语义检索问题，从而命中无关 chunk。
+
+## v1.7 多轮对话
+
+`/api/chat` 现在支持 `session_id`：
+
+```json
+{
+  "question": "第二点展开讲讲",
+  "top_k": 5,
+  "score_threshold": 0.2,
+  "session_id": "session_xxxxxxxxxxxx"
+}
+```
+
+如果没有传 `session_id`，后端会自动创建新会话，并在响应中返回：
+
+```json
+{
+  "session_id": "session_xxxxxxxxxxxx",
+  "rewritten_question": "包含最近会话上下文的检索问题",
+  "messages": []
+}
+```
+
+SQLite 新增表：
+
+```text
+chat_sessions   会话主表
+chat_messages   user / assistant 消息记录
+```
+
+检索前会把最近几轮对话拼入 `rewritten_question`，让“这个、它、第二点、继续展开”等追问可以带上上下文再进入 RAG 检索。
+
+查询会话消息：
+
+```text
+GET /api/chat/sessions/{session_id}/messages
+```
 
 ## v1.6 检索质量优化
 
