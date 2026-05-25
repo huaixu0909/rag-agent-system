@@ -60,6 +60,10 @@ OVERVIEW_MAX_DOCUMENTS_IN_ANSWER = 20
 DOCUMENT_SUMMARY_CHARS = 360
 DOCUMENT_TAG_MAX_COUNT = 12
 DOCUMENT_TAG_MAX_LENGTH = 24
+DEFAULT_CORS_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
 
 ChunkStrategy = Literal[
     "semantic",
@@ -77,12 +81,17 @@ app = FastAPI(
     version=APP_VERSION,
 )
 
+
+def get_cors_allowed_origins() -> list[str]:
+    configured_origins = os.getenv("CORS_ALLOWED_ORIGINS", "").strip()
+    if not configured_origins:
+        return DEFAULT_CORS_ALLOWED_ORIGINS
+    return [origin.strip() for origin in configured_origins.split(",") if origin.strip()]
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=get_cors_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
