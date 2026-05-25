@@ -318,6 +318,26 @@ POST /api/documents/upload/batch
 
 每个文件都会返回独立状态，前端可以展示上传、解析、入库或失败结果。当前 v1.2 是请求级进度反馈；如果后续要支持超大文件和后台任务，可以升级为任务队列 + 轮询进度。
 
+## Security Configuration
+
+Before deployment, configure an admin key in `.env`:
+
+```env
+ADMIN_API_KEY=replace-with-a-long-random-string
+```
+
+The following dangerous write operations require the `X-Admin-API-Key` request header:
+
+```text
+POST   /api/documents/upload
+POST   /api/documents/upload/batch
+PATCH  /api/documents/{document_id}/tags
+DELETE /api/documents/{document_id}
+POST   /api/vector-store/rebuild
+```
+
+`POST /api/search` and `POST /api/chat` are open to visitors but protected by in-memory IP rate limiting. If `ADMIN_API_KEY` is not configured, dangerous write operations are rejected to avoid accidental public deployment.
+
 ## v1.0 Chroma 向量数据库
 
 当前检索层已经从“遍历 JSON chunks”升级为：

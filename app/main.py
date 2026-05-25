@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
@@ -21,6 +21,7 @@ from pypdf import PdfReader
 from app.embeddings import embed_text, embedding_provider
 from app.rag_graph import NO_ENOUGH_CONTEXT_ANSWER, run_langgraph_rag_chat
 from app.rag_chain import generate_rag_answer_with_langchain
+from app.security import rate_limit, require_admin
 from app.vector_store import (
     chroma_available,
     delete_document_chunks,
@@ -2561,12 +2562,20 @@ def health_check() -> HealthResponse:
     )
 
 
-@app.post("/api/documents/upload", response_model=DocumentRecord)
+@app.post(
+    "/api/documents/upload",
+    response_model=DocumentRecord,
+    dependencies=[Depends(require_admin)],
+)
 async def upload_document(file: UploadFile = File(...)) -> DocumentRecord:
     return await ingest_upload_file(file)
 
 
-@app.post("/api/documents/upload/batch", response_model=IngestTaskResponse)
+@app.post(
+    "/api/documents/upload/batch",
+    response_model=IngestTaskResponse,
+    dependencies=[Depends(require_admin)],
+)
 async def upload_documents_batch(
     background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
@@ -2702,7 +2711,11 @@ def list_documents(
     return build_document_list_response(page, page_size)
 
 
-@app.patch("/api/documents/{document_id}/tags", response_model=DocumentRecord)
+@app.patch(
+    "/api/documents/{document_id}/tags",
+    response_model=DocumentRecord,
+    dependencies=[Depends(require_admin)],
+)
 def patch_document_tags(
     document_id: str,
     request: UpdateDocumentTagsRequest,
@@ -2738,7 +2751,11 @@ def vector_store_status() -> VectorStoreStatusResponse:
     return VectorStoreStatusResponse(**status, embedding_provider=embedding_provider())
 
 
-@app.post("/api/vector-store/rebuild", response_model=VectorStoreRebuildResponse)
+@app.post(
+    "/api/vector-store/rebuild",
+    response_model=VectorStoreRebuildResponse,
+    dependencies=[Depends(require_admin)],
+)
 def rebuild_vector_store() -> VectorStoreRebuildResponse:
     if not chroma_available():
         raise HTTPException(status_code=503, detail="Chroma is not available")
@@ -2760,7 +2777,11 @@ def rebuild_vector_store() -> VectorStoreRebuildResponse:
     )
 
 
-@app.delete("/api/documents/{document_id}", response_model=DeleteDocumentResponse)
+@app.delete(
+    "/api/documents/{document_id}",
+    response_model=DeleteDocumentResponse,
+    dependencies=[Depends(require_admin)],
+)
 def delete_document(document_id: str) -> DeleteDocumentResponse:
     documents = load_documents()
     document = next((item for item in documents if item.id == document_id), None)
@@ -2816,7 +2837,11 @@ def get_document_detail(document_id: str) -> DocumentDetail:
     )
 
 
-@app.post("/api/search", response_model=SearchResponse)
+@app.post(
+    "/api/search",
+    response_model=SearchResponse,
+    dependencies=[Depends(rate_limit("rag_search", limit=30, window_seconds=60))],
+)
 def search(request: SearchRequest) -> SearchResponse:
     return search_chunks(request)
 
@@ -2905,7 +2930,11 @@ def chat(request: ChatRequest) -> ChatResponse:
     )
 
 
-@app.post("/api/chat", response_model=ChatResponse)
+@app.post(
+    "/api/chat",
+    response_model=ChatResponse,
+    dependencies=[Depends(rate_limit("rag_chat", limit=12, window_seconds=60))],
+)
 def chat_with_strict_rag(request: ChatRequest) -> ChatResponse:
     session_id = ensure_chat_session(request.session_id, request.question)
     history = load_chat_messages(session_id)
