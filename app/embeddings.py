@@ -117,11 +117,16 @@ def embed_text_qwen(text: str) -> list[float] | None:
     return [float(value) for value in embedding]
 
 
-def embed_text(text: str) -> list[float]:
+def embed_text_with_provider(text: str) -> tuple[list[float], str]:
     qwen_embedding = embed_text_qwen(text)
     if qwen_embedding:
-        return qwen_embedding
-    return embed_text_local(text)
+        return qwen_embedding, "qwen"
+    return embed_text_local(text), "local_hash"
+
+
+def embed_text(text: str) -> list[float]:
+    embedding, _ = embed_text_with_provider(text)
+    return embedding
 
 
 def embedding_provider() -> str:

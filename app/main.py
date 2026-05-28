@@ -1,12 +1,11 @@
 import hashlib
 import json
+import logging
 import math
 import os
 import re
 import shutil
 import sqlite3
-import urllib.error
-import urllib.request
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -18,7 +17,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
-from app.embeddings import embed_text, embedding_provider
+from app.answering import build_retrieval_template_answer, call_deepseek_chat
+from app.embeddings import embed_text_with_provider, embedding_provider
 from app.rag_graph import NO_ENOUGH_CONTEXT_ANSWER, run_langgraph_rag_chat
 from app.rag_chain import generate_rag_answer_with_langchain
 from app.security import rate_limit, require_admin
@@ -42,6 +42,7 @@ DATABASE_FILE = DATA_DIR / "rag_agent.db"
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf"}
 
 APP_VERSION = "1.9.0"
+logger = logging.getLogger(__name__)
 EMBEDDING_DIM = 256
 TARGET_CHUNK_SIZE = 1200
 MAX_CHUNK_SIZE = 1800
@@ -218,6 +219,7 @@ class DeleteDocumentResponse(BaseModel):
     filename: str
     removed_files: list[str]
     vector_chunks_deleted: int = 0
+    vector_delete_error: str = ""
     sqlite_deleted: bool = True
 
 
@@ -259,6 +261,7 @@ class SearchResponse(BaseModel):
     mode: Literal["chroma", "local_hash_embedding"]
     retrieval_strategy: Literal["hybrid_rerank"] = "hybrid_rerank"
     query_terms: list[str] = Field(default_factory=list)
+    fallback_reason: str = ""
 
 
 class VectorStoreStatusResponse(BaseModel):
@@ -268,6 +271,7 @@ class VectorStoreStatusResponse(BaseModel):
     collection: str
     chunk_count: int
     embedding_provider: str = "local_hash"
+    error: str = ""
 
 
 class VectorStoreRebuildResponse(BaseModel):
@@ -1443,91 +1447,6 @@ def split_sentences(text: str) -> list[str]:
     return [piece.strip() for piece in pieces if piece.strip()]
 
 
-def build_semantic_units(text: str) -> list[SemanticUnit]:
-    units: list[SemanticUnit] = []
-    current_title = ""
-    current_level: int | None = None
-    paragraphs = [item.strip() for item in re.split(r"\n\s*\n", text.strip()) if item.strip()]
-
-    if len(paragraphs) <= 1:
-        paragraphs = split_sentences(text)
-
-    for paragraph in paragraphs:
-        lines = [line.strip() for line in paragraph.splitlines() if line.strip()]
-        if not lines:
-            continue
-
-        if len(lines) == 1:
-            heading = detect_heading(lines[0])
-            if heading:
-                current_title = heading.title
-                current_level = heading.level
-                units.append(
-                    SemanticUnit(
-                        content=lines[0],
-                        title=current_title,
-                        heading_level=current_level,
-                        is_heading=True,
-                    )
-                )
-                continue
-
-        content = "\n".join(lines)
-        if len(content) > MAX_CHUNK_SIZE:
-            for sentence in split_sentences(content):
-                units.append(
-                    SemanticUnit(
-                        content=sentence,
-                        title=current_title,
-                        heading_level=current_level,
-                    )
-                )
-        else:
-            units.append(
-                SemanticUnit(
-                    content=content,
-                    title=current_title,
-                    heading_level=current_level,
-                )
-            )
-
-    return units
-
-
-def detect_heading(line: str) -> Heading | None:
-    text = line.strip()
-    if not text or len(text) > 120:
-        return None
-
-    markdown = re.match(r"^(#{1,6})\s+(.+)$", text)
-    if markdown:
-        return Heading(title=markdown.group(2).strip(), level=len(markdown.group(1)))
-
-    numbered = re.match(r"^(\d+(?:\.\d+){0,5})[.\s]+(.+)$", text)
-    if numbered:
-        return Heading(title=text, level=min(numbered.group(1).count(".") + 1, 6))
-
-    chinese_number = r"[一二三四五六七八九十百]+"
-    if re.match(rf"^{chinese_number}[、.．\s]+(.+)$", text):
-        return Heading(title=text, level=1)
-
-    if re.match(rf"^[（(]{chinese_number}[）)]\s*(.+)$", text):
-        return Heading(title=text, level=2)
-
-    if re.match(rf"^第\s*({chinese_number}|\d+)\s*[章节篇部分]\s+(.+)$", text):
-        return Heading(title=text, level=1)
-
-    if re.match(r"^(chapter|section)\s+\d+[:.\s]+(.+)$", text, re.IGNORECASE):
-        return Heading(title=text, level=1)
-
-    return None
-
-
-def split_sentences(text: str) -> list[str]:
-    pieces = re.split(r"(?<=[。！？!?])\s*", text)
-    return [piece.strip() for piece in pieces if piece.strip()]
-
-
 def estimate_tokens(text: str) -> int:
     latin_words = re.findall(r"[A-Za-z0-9]+", text)
     chinese_chars = re.findall(r"[\u4e00-\u9fff]", text)
@@ -1631,6 +1550,13 @@ def build_semantic_units(text: str) -> list[SemanticUnit]:
 
 
 def cosine_similarity(left: list[float], right: list[float]) -> float:
+    if len(left) != len(right):
+        logger.warning(
+            "Embedding dimension mismatch during local search: left=%s right=%s",
+            len(left),
+            len(right),
+        )
+        return 0.0
     return sum(a * b for a, b in zip(left, right))
 
 
@@ -1771,6 +1697,7 @@ def build_chunk(
     page_end: int | None = None,
 ) -> DocumentChunk:
     clean_content = content.strip()
+    embedding, provider = embed_text_with_provider(clean_content)
     return DocumentChunk(
         id=f"{document_id}_chunk_{index:04d}",
         document_id=document_id,
@@ -1785,8 +1712,8 @@ def build_chunk(
         token_estimate=estimate_tokens(clean_content),
         page_start=page_start,
         page_end=page_end,
-        embedding=embed_text(clean_content),
-        embedding_provider=embedding_provider(),
+        embedding=embedding,
+        embedding_provider=provider,
     )
 
 
@@ -1855,7 +1782,7 @@ def split_text_into_chunks(text: str, document_id: str) -> list[DocumentChunk]:
             for index, content in enumerate(split_by_length(normalized_text))
         ]
 
-    embeddings = [embed_text(unit.content) for unit in units]
+    embeddings = [embed_text_with_provider(unit.content)[0] for unit in units]
     similarities = [
         cosine_similarity(embeddings[index - 1], embeddings[index])
         for index in range(1, len(embeddings))
@@ -1955,8 +1882,7 @@ def apply_chunk_overlaps(chunks: list[DocumentChunk]) -> None:
             for item in (chunk.overlap_previous, chunk.content, chunk.overlap_next)
             if item
         )
-        chunk.embedding = embed_text(embedding_text)
-        chunk.embedding_provider = embedding_provider()
+        chunk.embedding, chunk.embedding_provider = embed_text_with_provider(embedding_text)
 
 
 def save_parsed_text(document_id: str, text: str) -> Path:
@@ -1991,9 +1917,8 @@ def load_chunks(document: DocumentRecord) -> list[DocumentChunk]:
         chunk = DocumentChunk(**item)
         if chunk.token_estimate == 0:
             chunk.token_estimate = estimate_tokens(chunk.content)
-        if not chunk.embedding or chunk.embedding_provider != embedding_provider():
-            chunk.embedding = embed_text(chunk.content)
-            chunk.embedding_provider = embedding_provider()
+        if not chunk.embedding:
+            chunk.embedding, chunk.embedding_provider = embed_text_with_provider(chunk.content)
             changed = True
         chunks.append(chunk)
 
@@ -2045,12 +1970,13 @@ def delete_data_file(relative_file_path: str) -> str | None:
 
 
 def search_chunks(request: SearchRequest) -> SearchResponse:
-    question_embedding = embed_text(request.question)
+    question_embedding, question_provider = embed_text_with_provider(request.question)
     query_terms = extract_search_terms(request.question)
     candidate_top_k = min(
         RERANK_CANDIDATE_MAX,
         max(request.top_k, request.top_k * RERANK_CANDIDATE_MULTIPLIER),
     )
+    fallback_reason = ""
 
     if chroma_available():
         try:
@@ -2110,8 +2036,9 @@ def search_chunks(request: SearchRequest) -> SearchResponse:
                     mode="chroma",
                     query_terms=query_terms[:24],
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            fallback_reason = f"Chroma query failed; used local chunk search. {exc}"
+            logger.warning("Chroma query failed; falling back to local chunk search", exc_info=True)
 
     documents = load_documents()
     results: list[SearchResult] = []
@@ -2122,7 +2049,9 @@ def search_chunks(request: SearchRequest) -> SearchResponse:
         total_chunks += len(chunks)
 
         for chunk in chunks:
-            chunk_embedding = chunk.embedding or embed_text(chunk.content)
+            if not chunk.embedding or chunk.embedding_provider != question_provider:
+                chunk.embedding, chunk.embedding_provider = embed_text_with_provider(chunk.content)
+            chunk_embedding = chunk.embedding
             score = cosine_similarity(question_embedding, chunk_embedding)
             results.append(
                 SearchResult(
@@ -2159,6 +2088,7 @@ def search_chunks(request: SearchRequest) -> SearchResponse:
         results=filtered_results[: request.top_k],
         mode="local_hash_embedding",
         query_terms=query_terms[:24],
+        fallback_reason=fallback_reason,
     )
 
 
@@ -2176,204 +2106,6 @@ def build_sources(results: list[SearchResult]) -> list[Source]:
         )
         for item in results
     ]
-
-
-def build_retrieval_template_answer(question: str, results: list[SearchResult]) -> str:
-    summary_lines = [
-        f"{index}. 《{item.document_filename}》chunk {item.chunk_index}，相似度 {item.score:.3f}"
-        for index, item in enumerate(results, start=1)
-    ]
-    return (
-        "已根据你的问题完成本地向量检索。当前没有成功调用 LLM，"
-        "所以先返回命中的文档片段作为回答依据：\n"
-        + "\n".join(summary_lines)
-        + f"\n\n用户问题：{question}"
-    )
-
-
-def build_rag_prompt(question: str, results: list[SearchResult]) -> str:
-    context_blocks = []
-    for index, item in enumerate(results, start=1):
-        page_text = ""
-        if item.page_start:
-            page_text = f"页码：{item.page_start}"
-            if item.page_end and item.page_end != item.page_start:
-                page_text += f"-{item.page_end}"
-
-        section_text = " / ".join(item.section_path) if item.section_path else "未识别章节"
-        context_blocks.append(
-            "\n".join(
-                [
-                    f"[来源 {index}]",
-                    f"文档：{item.document_filename}",
-                    f"chunk：{item.chunk_index}",
-                    f"相似度：{item.score:.3f}",
-                    f"章节：{section_text}",
-                    page_text,
-                    "内容：",
-                    item.content,
-                ]
-            ).strip()
-        )
-
-    return (
-        "你是一个严谨的中文知识库问答助手。请只根据给定资料回答用户问题。\n"
-        "如果资料不足，请明确说明“当前文档中没有足够信息”。\n"
-        "回答要清晰、具体、不要编造。最后用简短列表给出依据来源。\n\n"
-        f"用户问题：\n{question}\n\n"
-        "参考资料：\n"
-        + "\n\n".join(context_blocks)
-    )
-
-
-def call_deepseek_chat(question: str, results: list[SearchResult]) -> str | None:
-    load_env_file()
-    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
-    if not api_key:
-        return None
-
-    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
-    model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-    url = f"{base_url}/chat/completions"
-
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": "你是一个可靠的 RAG 问答助手，只能基于用户提供的参考资料回答。",
-            },
-            {
-                "role": "user",
-                "content": build_rag_prompt(question, results),
-            },
-        ],
-        "temperature": 0.2,
-        "max_tokens": 1200,
-    }
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(
-        url=url,
-        data=body,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-        return None
-
-    choices = data.get("choices") or []
-    if not choices:
-        return None
-
-    message = choices[0].get("message") or {}
-    answer = str(message.get("content") or "").strip()
-    return answer or None
-
-
-def build_retrieval_template_answer(question: str, results: list[SearchResult]) -> str:
-    summary_lines = [
-        f"{index}. 《{item.document_filename}》chunk {item.chunk_index}，相似度 {item.score:.3f}"
-        for index, item in enumerate(results, start=1)
-    ]
-    return (
-        "已完成知识库检索，但没有成功调用 LLM。以下是可作为回答依据的命中文档片段：\n"
-        + "\n".join(summary_lines)
-        + f"\n\n用户问题：{question}"
-    )
-
-
-def build_rag_prompt(question: str, results: list[SearchResult]) -> str:
-    context_blocks = []
-    for index, item in enumerate(results, start=1):
-        page_text = "无页码"
-        if item.page_start:
-            page_text = f"第 {item.page_start} 页"
-            if item.page_end and item.page_end != item.page_start:
-                page_text = f"第 {item.page_start}-{item.page_end} 页"
-
-        section_text = " / ".join(item.section_path) if item.section_path else "未识别章节"
-        context_blocks.append(
-            "\n".join(
-                [
-                    f"[来源 {index}]",
-                    f"文档：{item.document_filename}",
-                    f"chunk：{item.chunk_index}",
-                    f"相似度：{item.score:.3f}",
-                    f"章节：{section_text}",
-                    f"页码：{page_text}",
-                    "内容：",
-                    item.content,
-                ]
-            )
-        )
-
-    return (
-        "你是一个严谨的中文知识库问答助手。请只根据给定资料回答用户问题。\n"
-        "如果资料不足，请明确回答：当前知识库中没有足够信息回答这个问题。\n"
-        "禁止使用资料之外的知识补全答案，禁止编造。\n"
-        "回答必须先给结论，再给依据，并在依据中引用来源编号。\n\n"
-        f"用户问题：\n{question}\n\n"
-        "参考资料：\n"
-        + "\n\n".join(context_blocks)
-    )
-
-
-def call_deepseek_chat(question: str, results: list[SearchResult]) -> str | None:
-    load_env_file()
-    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
-    if not api_key:
-        return None
-
-    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
-    model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-    url = f"{base_url}/chat/completions"
-
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": "你是可靠的 RAG 问答助手，只能基于参考资料回答，并必须引用来源编号。",
-            },
-            {
-                "role": "user",
-                "content": build_rag_prompt(question, results),
-            },
-        ],
-        "temperature": 0.2,
-        "max_tokens": 1200,
-    }
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(
-        url=url,
-        data=body,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-        return None
-
-    choices = data.get("choices") or []
-    if not choices:
-        return None
-
-    message = choices[0].get("message") or {}
-    answer = str(message.get("content") or "").strip()
-    return answer or None
 
 
 async def ingest_upload_file(file: UploadFile) -> DocumentRecord:
@@ -2446,7 +2178,11 @@ async def ingest_upload_file(file: UploadFile) -> DocumentRecord:
     try:
         upsert_document_chunks(document, chunks)
     except Exception:
-        pass
+        logger.warning(
+            "Failed to upsert chunks into Chroma for document %s",
+            document.id,
+            exc_info=True,
+        )
 
     insert_document_record(document)
 
@@ -2525,7 +2261,11 @@ def process_ingest_task(task_id: str) -> None:
             try:
                 upsert_document_chunks(document, chunks)
             except Exception:
-                pass
+                logger.warning(
+                    "Failed to upsert chunks into Chroma for document %s",
+                    document.id,
+                    exc_info=True,
+                )
 
             insert_document_record(document)
             update_ingest_task_file(
@@ -2747,7 +2487,8 @@ def vector_store_status() -> VectorStoreStatusResponse:
 
     try:
         status = get_vector_store_status()
-    except Exception:
+    except Exception as exc:
+        logger.warning("Failed to read Chroma vector store status", exc_info=True)
         return VectorStoreStatusResponse(
             provider="chroma",
             available=False,
@@ -2755,6 +2496,7 @@ def vector_store_status() -> VectorStoreStatusResponse:
             collection="rag_chunks",
             chunk_count=0,
             embedding_provider=embedding_provider(),
+            error=str(exc),
         )
 
     return VectorStoreStatusResponse(**status, embedding_provider=embedding_provider())
@@ -2799,10 +2541,16 @@ def delete_document(document_id: str) -> DeleteDocumentResponse:
         raise HTTPException(status_code=404, detail="Document not found")
 
     vector_chunks_deleted = 0
+    vector_delete_error = ""
     try:
         vector_chunks_deleted = delete_document_chunks(document.id)
-    except Exception:
-        pass
+    except Exception as exc:
+        vector_delete_error = str(exc)
+        logger.warning(
+            "Failed to delete Chroma chunks for document %s",
+            document.id,
+            exc_info=True,
+        )
 
     removed_files = [
         removed
@@ -2822,6 +2570,7 @@ def delete_document(document_id: str) -> DeleteDocumentResponse:
         filename=document.filename,
         removed_files=removed_files,
         vector_chunks_deleted=vector_chunks_deleted,
+        vector_delete_error=vector_delete_error,
         sqlite_deleted=True,
     )
 
@@ -2853,90 +2602,6 @@ def get_document_detail(document_id: str) -> DocumentDetail:
 )
 def search(request: SearchRequest) -> SearchResponse:
     return search_chunks(request)
-
-
-@app.post(
-    "/api/chat-template-disabled",
-    response_model=ChatResponse,
-    include_in_schema=False,
-)
-def chat_template_disabled(request: ChatRequest) -> ChatResponse:
-    search_response = search_chunks(SearchRequest(question=request.question, top_k=3))
-
-    if not search_response.results:
-        return ChatResponse(
-            answer="当前知识库还没有可检索的文本块。请先上传并解析文档，再发送问题。",
-            sources=[],
-            mode="retrieval_template",
-        )
-
-    summary_lines = [
-        f"{index}. 《{item.document_filename}》chunk {item.chunk_index}，相似度 {item.score:.3f}"
-        for index, item in enumerate(search_response.results, start=1)
-    ]
-    answer = (
-        "已根据你的问题完成本地向量检索。当前版本还没有接入真实 LLM，"
-        "所以先返回命中的文档片段作为回答依据：\n"
-        + "\n".join(summary_lines)
-    )
-
-    return ChatResponse(
-        answer=answer,
-        sources=[
-            Source(
-                title=f"{item.document_filename} / chunk {item.chunk_index}",
-                content=item.content[:500],
-            )
-            for item in search_response.results
-        ],
-        mode="retrieval_template",
-    )
-
-
-@app.post("/api/chat-legacy-disabled", response_model=ChatResponse, include_in_schema=False)
-def chat(request: ChatRequest) -> ChatResponse:
-    search_response = search_chunks(
-        SearchRequest(
-            question=request.question,
-            top_k=request.top_k,
-            score_threshold=request.score_threshold,
-        )
-    )
-
-    if not search_response.results:
-        return ChatResponse(
-            answer="当前知识库还没有可检索的文本块。请先上传并解析文档，再发送问题。",
-            sources=[],
-            mode="retrieval_template",
-        )
-
-    sources = build_sources(search_response.results)
-    langchain_answer = generate_rag_answer_with_langchain(
-        question=request.question,
-        chunks=[item.model_dump() for item in search_response.results],
-    )
-
-    if langchain_answer:
-        return ChatResponse(
-            answer=langchain_answer,
-            sources=sources,
-            mode="langchain_deepseek",
-        )
-
-    answer = call_deepseek_chat(request.question, search_response.results)
-
-    if answer:
-        return ChatResponse(
-            answer=answer,
-            sources=sources,
-            mode="deepseek",
-        )
-
-    return ChatResponse(
-        answer=build_retrieval_template_answer(request.question, search_response.results),
-        sources=sources,
-        mode="retrieval_template",
-    )
 
 
 @app.post(
