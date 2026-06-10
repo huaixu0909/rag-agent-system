@@ -56,6 +56,8 @@ SEARCH_TOP_K_MAX = 20
 SEARCH_SCORE_THRESHOLD_DEFAULT = 0.2
 RERANK_CANDIDATE_MULTIPLIER = 6
 RERANK_CANDIDATE_MAX = 80
+HYBRID_VECTOR_WEIGHT = 0.65
+HYBRID_KEYWORD_WEIGHT = 0.35
 OVERVIEW_PREVIEW_CHARS = 260
 OVERVIEW_MAX_DOCUMENTS_IN_ANSWER = 20
 DOCUMENT_SUMMARY_CHARS = 360
@@ -259,7 +261,7 @@ class SearchResponse(BaseModel):
     total_chunks: int
     results: list[SearchResult]
     mode: Literal["chroma", "local_hash_embedding"]
-    retrieval_strategy: Literal["hybrid_rerank"] = "hybrid_rerank"
+    retrieval_strategy: Literal["hybrid_fusion"] = "hybrid_fusion"
     query_terms: list[str] = Field(default_factory=list)
     fallback_reason: str = ""
 
@@ -446,6 +448,24 @@ def initialize_database() -> None:
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_documents_content_hash ON documents(content_hash)"
+        )
+        connection.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5 (
+                chunk_id UNINDEXED,
+                document_id UNINDEXED,
+                document_filename,
+                chunk_index UNINDEXED,
+                title,
+                section_path,
+                content,
+                char_count UNINDEXED,
+                strategy UNINDEXED,
+                token_estimate UNINDEXED,
+                page_start UNINDEXED,
+                page_end UNINDEXED
+            )
+            """
         )
         connection.execute(
             """
@@ -1621,33 +1641,189 @@ def lexical_rerank_score(question: str, result: SearchResult, query_terms: list[
     return round(max(0.0, min(1.0, coverage_score * 0.82 + phrase_score * 0.18)), 6)
 
 
-def apply_hybrid_rerank(
-    *, question: str, results: list[SearchResult], query_terms: list[str]
-) -> list[SearchResult]:
-    reranked: list[SearchResult] = []
+def build_fts_query(query_terms: list[str]) -> str:
+    quoted_terms: list[str] = []
+    for term in query_terms[:16]:
+        clean_term = term.strip().replace('"', '""')
+        if len(clean_term) < 2:
+            continue
+        quoted_terms.append(f'"{clean_term}"')
+    return " OR ".join(quoted_terms)
 
-    for result in results:
-        vector_score = result.vector_score or result.score
-        lexical_score = lexical_rerank_score(question, result, query_terms)
+
+def search_result_from_fts_row(row: sqlite3.Row, keyword_score: float = 0.0) -> SearchResult:
+    section_path = [
+        part.strip()
+        for part in str(row["section_path"] or "").split("/")
+        if part.strip()
+    ]
+    return SearchResult(
+        document_id=str(row["document_id"] or ""),
+        document_filename=str(row["document_filename"] or ""),
+        chunk_id=str(row["chunk_id"] or ""),
+        chunk_index=int(row["chunk_index"] or 0),
+        title=str(row["title"] or ""),
+        score=round(keyword_score, 6),
+        vector_score=0.0,
+        lexical_score=round(keyword_score, 6),
+        rerank_score=round(keyword_score, 6),
+        content=str(row["content"] or ""),
+        char_count=int(row["char_count"] or 0),
+        strategy=row["strategy"] or "length_fallback",
+        section_path=section_path,
+        token_estimate=int(row["token_estimate"] or 0),
+        page_start=int(row["page_start"]) if row["page_start"] is not None else None,
+        page_end=int(row["page_end"]) if row["page_end"] is not None else None,
+    )
+
+
+def normalize_keyword_rows(rows: list[sqlite3.Row]) -> list[SearchResult]:
+    if not rows:
+        return []
+
+    ranks = [float(row["rank"] or 0.0) for row in rows]
+    best_rank = min(ranks)
+    worst_rank = max(ranks)
+    results: list[SearchResult] = []
+    for row, rank in zip(rows, ranks):
+        if math.isclose(best_rank, worst_rank):
+            keyword_score = 1.0
+        else:
+            keyword_score = 1.0 - ((rank - best_rank) / (worst_rank - best_rank))
+        results.append(search_result_from_fts_row(row, max(0.0, min(1.0, keyword_score))))
+    return results
+
+
+def query_keyword_chunks(question: str, query_terms: list[str], top_k: int) -> list[SearchResult]:
+    ensure_keyword_index_populated()
+    fts_query = build_fts_query(query_terms)
+    if not fts_query:
+        return []
+
+    try:
+        with open_database() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    chunk_id, document_id, document_filename, chunk_index,
+                    title, section_path, content, char_count, strategy,
+                    token_estimate, page_start, page_end,
+                    bm25(chunks_fts) AS rank
+                FROM chunks_fts
+                WHERE chunks_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (fts_query, top_k),
+            ).fetchall()
+    except sqlite3.Error:
+        logger.warning("SQLite FTS keyword search failed", exc_info=True)
+        return []
+
+    keyword_results = normalize_keyword_rows(rows)
+    if keyword_results:
+        return keyword_results
+
+    like_clauses: list[str] = []
+    values: list[object] = []
+    for term in query_terms[:8]:
+        if len(term) < 2:
+            continue
+        like_clauses.append(
+            """
+            (
+                document_filename LIKE ?
+                OR title LIKE ?
+                OR section_path LIKE ?
+                OR content LIKE ?
+            )
+            """
+        )
+        pattern = f"%{term}%"
+        values.extend([pattern, pattern, pattern, pattern])
+
+    if not like_clauses:
+        return []
+
+    try:
+        with open_database() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    chunk_id, document_id, document_filename, chunk_index,
+                    title, section_path, content, char_count, strategy,
+                    token_estimate, page_start, page_end,
+                    0.0 AS rank
+                FROM chunks_fts
+                WHERE {" OR ".join(like_clauses)}
+                LIMIT ?
+                """,
+                [*values, top_k],
+            ).fetchall()
+    except sqlite3.Error:
+        logger.warning("SQLite LIKE keyword search fallback failed", exc_info=True)
+        return []
+
+    results = [
+        search_result_from_fts_row(
+            row,
+            lexical_rerank_score(question, search_result_from_fts_row(row), query_terms),
+        )
+        for row in rows
+    ]
+    return sorted(results, key=lambda item: item.lexical_score, reverse=True)
+
+
+def apply_hybrid_fusion(
+    *,
+    question: str,
+    vector_results: list[SearchResult],
+    keyword_results: list[SearchResult],
+    query_terms: list[str],
+) -> list[SearchResult]:
+    merged: dict[str, SearchResult] = {}
+
+    for result in vector_results:
+        merged[result.chunk_id] = result.model_copy()
+
+    for result in keyword_results:
+        existing = merged.get(result.chunk_id)
+        if existing is None:
+            merged[result.chunk_id] = result.model_copy()
+            continue
+        existing.lexical_score = max(existing.lexical_score, result.lexical_score)
+        existing.content = existing.content or result.content
+        existing.title = existing.title or result.title
+        existing.section_path = existing.section_path or result.section_path
+
+    fused_results: list[SearchResult] = []
+    for result in merged.values():
+        lexical_score = max(
+            result.lexical_score,
+            lexical_rerank_score(question, result, query_terms),
+        )
         structural_boost = 0.0
         if result.title:
             structural_boost += 0.025
         if result.section_path:
             structural_boost += 0.025
-
-        rerank_score = min(
+        fused_score = min(
             1.0,
-            max(0.0, vector_score * 0.72 + lexical_score * 0.28 + structural_boost),
+            max(
+                0.0,
+                result.vector_score * HYBRID_VECTOR_WEIGHT
+                + lexical_score * HYBRID_KEYWORD_WEIGHT
+                + structural_boost,
+            ),
         )
-        result.vector_score = round(vector_score, 6)
-        result.lexical_score = lexical_score
-        result.rerank_score = round(rerank_score, 6)
+        result.lexical_score = round(lexical_score, 6)
+        result.rerank_score = round(fused_score, 6)
         result.score = result.rerank_score
-        reranked.append(result)
+        fused_results.append(result)
 
     return sorted(
-        reranked,
-        key=lambda item: (item.rerank_score, item.lexical_score, item.vector_score),
+        fused_results,
+        key=lambda item: (item.rerank_score, item.vector_score, item.lexical_score),
         reverse=True,
     )
 
@@ -1898,6 +2074,58 @@ def save_chunks(document_id: str, chunks: list[DocumentChunk]) -> Path:
     return chunks_path
 
 
+def delete_keyword_chunks(document_id: str) -> int:
+    with open_database() as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM chunks_fts WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()
+        deleted = int(row[0] if row is not None else 0)
+        connection.execute("DELETE FROM chunks_fts WHERE document_id = ?", (document_id,))
+        connection.commit()
+    return deleted
+
+
+def upsert_keyword_chunks(document: DocumentRecord, chunks: list[DocumentChunk]) -> int:
+    with open_database() as connection:
+        connection.execute("DELETE FROM chunks_fts WHERE document_id = ?", (document.id,))
+        connection.executemany(
+            """
+            INSERT INTO chunks_fts (
+                chunk_id, document_id, document_filename, chunk_index,
+                title, section_path, content, char_count, strategy,
+                token_estimate, page_start, page_end
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    chunk.id,
+                    document.id,
+                    document.filename,
+                    chunk.index,
+                    chunk.title,
+                    " / ".join(chunk.section_path),
+                    chunk.content,
+                    chunk.char_count,
+                    chunk.strategy,
+                    chunk.token_estimate,
+                    chunk.page_start,
+                    chunk.page_end,
+                )
+                for chunk in chunks
+            ],
+        )
+        connection.commit()
+    return len(chunks)
+
+
+def reset_keyword_index() -> None:
+    with open_database() as connection:
+        connection.execute("DELETE FROM chunks_fts")
+        connection.commit()
+
+
 def load_chunks(document: DocumentRecord) -> list[DocumentChunk]:
     if not document.chunks_path:
         return []
@@ -1929,6 +2157,28 @@ def load_chunks(document: DocumentRecord) -> list[DocumentChunk]:
         save_chunks(document.id, chunks)
 
     return chunks
+
+
+def ensure_keyword_index_populated() -> None:
+    with open_database() as connection:
+        row = connection.execute(
+            """
+            SELECT
+                COALESCE((SELECT SUM(chunk_count) FROM documents), 0) AS expected,
+                (SELECT COUNT(*) FROM chunks_fts) AS indexed
+            """
+        ).fetchone()
+
+    expected = int(row["expected"] or 0) if row is not None else 0
+    indexed = int(row["indexed"] or 0) if row is not None else 0
+    if expected == 0 or indexed >= expected:
+        return
+
+    reset_keyword_index()
+    for document in load_documents():
+        chunks = load_chunks(document)
+        if chunks:
+            upsert_keyword_chunks(document, chunks)
 
 
 def load_parsed_preview(document: DocumentRecord) -> str:
@@ -1970,6 +2220,7 @@ def delete_data_file(relative_file_path: str) -> str | None:
 
 
 def search_chunks(request: SearchRequest) -> SearchResponse:
+    ensure_data_dirs()
     question_embedding, question_provider = embed_text_with_provider(request.question)
     query_terms = extract_search_terms(request.question)
     candidate_top_k = min(
@@ -1977,12 +2228,20 @@ def search_chunks(request: SearchRequest) -> SearchResponse:
         max(request.top_k, request.top_k * RERANK_CANDIDATE_MULTIPLIER),
     )
     fallback_reason = ""
+    vector_results: list[SearchResult] = []
+    total_chunks = 0
+    mode: Literal["chroma", "local_hash_embedding"] = "local_hash_embedding"
 
     if chroma_available():
         try:
             raw_chroma_results = query_chunks(question_embedding, candidate_top_k)
+            mode = "chroma"
+            try:
+                total_chunks = int(get_vector_store_status()["chunk_count"])
+            except Exception:
+                total_chunks = len(raw_chroma_results)
             if raw_chroma_results:
-                candidate_results = [
+                vector_results = [
                     SearchResult(
                         document_id=str(item["metadata"].get("document_id") or ""),
                         document_filename=str(
@@ -2017,64 +2276,48 @@ def search_chunks(request: SearchRequest) -> SearchResponse:
                     )
                     for item in raw_chroma_results
                 ]
-                reranked_results = apply_hybrid_rerank(
-                    question=request.question,
-                    results=candidate_results,
-                    query_terms=query_terms,
-                )
-                filtered_results = [
-                    item
-                    for item in reranked_results
-                    if item.score >= request.score_threshold
-                ]
-                return SearchResponse(
-                    question=request.question,
-                    top_k=request.top_k,
-                    score_threshold=request.score_threshold,
-                    total_chunks=get_vector_store_status()["chunk_count"],
-                    results=filtered_results[: request.top_k],
-                    mode="chroma",
-                    query_terms=query_terms[:24],
-                )
         except Exception as exc:
             fallback_reason = f"Chroma query failed; used local chunk search. {exc}"
             logger.warning("Chroma query failed; falling back to local chunk search", exc_info=True)
 
-    documents = load_documents()
-    results: list[SearchResult] = []
-    total_chunks = 0
+    keyword_results = query_keyword_chunks(request.question, query_terms, candidate_top_k)
 
-    for document in documents:
-        chunks = load_chunks(document)
-        total_chunks += len(chunks)
+    if mode == "local_hash_embedding":
+        documents = load_documents()
+        total_chunks = 0
 
-        for chunk in chunks:
-            if not chunk.embedding or chunk.embedding_provider != question_provider:
-                chunk.embedding, chunk.embedding_provider = embed_text_with_provider(chunk.content)
-            chunk_embedding = chunk.embedding
-            score = cosine_similarity(question_embedding, chunk_embedding)
-            results.append(
-                SearchResult(
-                    document_id=document.id,
-                    document_filename=document.filename,
-                    chunk_id=chunk.id,
-                    chunk_index=chunk.index,
-                    title=chunk.title,
-                    score=round(score, 6),
-                    vector_score=round(score, 6),
-                    content=chunk.content,
-                    char_count=chunk.char_count,
-                    strategy=chunk.strategy,
-                    section_path=chunk.section_path,
-                    token_estimate=chunk.token_estimate,
-                    page_start=chunk.page_start,
-                    page_end=chunk.page_end,
+        for document in documents:
+            chunks = load_chunks(document)
+            total_chunks += len(chunks)
+
+            for chunk in chunks:
+                if not chunk.embedding or chunk.embedding_provider != question_provider:
+                    chunk.embedding, chunk.embedding_provider = embed_text_with_provider(chunk.content)
+                chunk_embedding = chunk.embedding
+                score = cosine_similarity(question_embedding, chunk_embedding)
+                vector_results.append(
+                    SearchResult(
+                        document_id=document.id,
+                        document_filename=document.filename,
+                        chunk_id=chunk.id,
+                        chunk_index=chunk.index,
+                        title=chunk.title,
+                        score=round(score, 6),
+                        vector_score=round(score, 6),
+                        content=chunk.content,
+                        char_count=chunk.char_count,
+                        strategy=chunk.strategy,
+                        section_path=chunk.section_path,
+                        token_estimate=chunk.token_estimate,
+                        page_start=chunk.page_start,
+                        page_end=chunk.page_end,
+                    )
                 )
-            )
 
-    ranked_results = apply_hybrid_rerank(
+    ranked_results = apply_hybrid_fusion(
         question=request.question,
-        results=results,
+        vector_results=vector_results,
+        keyword_results=keyword_results,
         query_terms=query_terms,
     )
     filtered_results = [
@@ -2086,7 +2329,7 @@ def search_chunks(request: SearchRequest) -> SearchResponse:
         score_threshold=request.score_threshold,
         total_chunks=total_chunks,
         results=filtered_results[: request.top_k],
-        mode="local_hash_embedding",
+        mode=mode,
         query_terms=query_terms[:24],
         fallback_reason=fallback_reason,
     )
@@ -2183,6 +2426,14 @@ async def ingest_upload_file(file: UploadFile) -> DocumentRecord:
             document.id,
             exc_info=True,
         )
+    try:
+        upsert_keyword_chunks(document, chunks)
+    except Exception:
+        logger.warning(
+            "Failed to upsert chunks into SQLite FTS for document %s",
+            document.id,
+            exc_info=True,
+        )
 
     insert_document_record(document)
 
@@ -2263,6 +2514,14 @@ def process_ingest_task(task_id: str) -> None:
             except Exception:
                 logger.warning(
                     "Failed to upsert chunks into Chroma for document %s",
+                    document.id,
+                    exc_info=True,
+                )
+            try:
+                upsert_keyword_chunks(document, chunks)
+            except Exception:
+                logger.warning(
+                    "Failed to upsert chunks into SQLite FTS for document %s",
                     document.id,
                     exc_info=True,
                 )
@@ -2512,6 +2771,7 @@ def rebuild_vector_store() -> VectorStoreRebuildResponse:
         raise HTTPException(status_code=503, detail="Chroma is not available")
 
     reset_collection()
+    reset_keyword_index()
     documents = load_documents()
     chunk_count = 0
 
@@ -2519,6 +2779,7 @@ def rebuild_vector_store() -> VectorStoreRebuildResponse:
         chunks = load_chunks(document)
         if chunks:
             chunk_count += upsert_document_chunks(document, chunks)
+            upsert_keyword_chunks(document, chunks)
 
     return VectorStoreRebuildResponse(
         rebuilt=True,
@@ -2548,6 +2809,14 @@ def delete_document(document_id: str) -> DeleteDocumentResponse:
         vector_delete_error = str(exc)
         logger.warning(
             "Failed to delete Chroma chunks for document %s",
+            document.id,
+            exc_info=True,
+        )
+    try:
+        delete_keyword_chunks(document.id)
+    except Exception:
+        logger.warning(
+            "Failed to delete SQLite FTS chunks for document %s",
             document.id,
             exc_info=True,
         )
